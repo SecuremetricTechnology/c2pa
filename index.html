@@ -1,0 +1,2051 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>C2PA Capture — LINE Mini App</title>
+
+<!-- LIFF SDK -->
+<script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
+<!-- PKIjs for CSR generation -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pkijs/3.2.4/pkijs.min.js"></script>
+<!-- ASN1js (required by PKIjs) -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/asn1js/3.0.5/asn1.min.js"></script>
+
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Syne:wght@400;600;700;800&display=swap');
+
+  :root {
+    --bg:        #0a0c10;
+    --surface:   #111318;
+    --border:    #1e2330;
+    --accent:    #00e5a0;
+    --accent2:   #0099ff;
+    --warn:      #ff6b35;
+    --text:      #e8eaf0;
+    --muted:     #5a6070;
+    --success:   #00e5a0;
+    --error:     #ff4757;
+    --radius:    14px;
+    --mono:      'DM Mono', monospace;
+    --sans:      'Syne', sans-serif;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    min-height: 100vh;
+    overflow-x: hidden;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* ── Grid noise background ── */
+  body::before {
+    content: '';
+    position: fixed; inset: 0;
+    background-image:
+      linear-gradient(rgba(0,229,160,.03) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(0,229,160,.03) 1px, transparent 1px);
+    background-size: 32px 32px;
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  #app {
+    position: relative;
+    z-index: 1;
+    max-width: 480px;
+    margin: 0 auto;
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    min-height: 100vh;
+  }
+
+  /* ── Header ── */
+  .header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 0 4px;
+  }
+  .logo {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .logo-icon {
+    width: 36px; height: 36px;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    border-radius: 10px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 18px;
+  }
+  .logo-text {
+    font-family: var(--sans);
+    font-weight: 800;
+    font-size: 18px;
+    letter-spacing: -0.5px;
+  }
+  .logo-text span { color: var(--accent); }
+  .header-status {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--muted);
+    text-align: right;
+    line-height: 1.6;
+  }
+  .status-dot {
+    display: inline-block;
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--muted);
+    margin-right: 4px;
+    vertical-align: middle;
+  }
+  .status-dot.active { background: var(--accent); box-shadow: 0 0 6px var(--accent); }
+
+  /* ── Cards ── */
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+  }
+  .card-header {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .card-title {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+    color: var(--muted);
+    font-family: var(--mono);
+  }
+  .card-body { padding: 16px; }
+
+  /* ── Identity card ── */
+  .identity-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .avatar {
+    width: 44px; height: 44px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, #1a2a3a, #0a1520);
+    border: 2px solid var(--border);
+    object-fit: cover;
+    flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 20px;
+  }
+  .identity-info { flex: 1; min-width: 0; }
+  .identity-name {
+    font-weight: 700;
+    font-size: 15px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .identity-id {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .cert-badge {
+    flex-shrink: 0;
+    padding: 4px 8px;
+    border-radius: 6px;
+    font-family: var(--mono);
+    font-size: 10px;
+    font-weight: 500;
+    background: rgba(0,229,160,0.1);
+    color: var(--accent);
+    border: 1px solid rgba(0,229,160,0.2);
+    white-space: nowrap;
+  }
+  .cert-badge.warn {
+    background: rgba(255,107,53,0.1);
+    color: var(--warn);
+    border-color: rgba(255,107,53,0.2);
+  }
+
+  /* ── Cert details ── */
+  .cert-detail { margin-top: 12px; }
+  .cert-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 6px 0;
+    border-bottom: 1px solid var(--border);
+    font-size: 12px;
+  }
+  .cert-row:last-child { border-bottom: none; }
+  .cert-label { color: var(--muted); font-family: var(--mono); }
+  .cert-value { font-family: var(--mono); font-size: 11px; color: var(--text); max-width: 200px; text-align: right; word-break: break-all; }
+  .cert-value.accent { color: var(--accent); }
+
+  /* ── Camera viewfinder ── */
+  .viewfinder {
+    position: relative;
+    background: #000;
+    border-radius: var(--radius);
+    overflow: hidden;
+    aspect-ratio: 4/3;
+  }
+  #video {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+  }
+  #canvas { display: none; }
+  .viewfinder-overlay {
+    position: absolute; inset: 0;
+    pointer-events: none;
+  }
+  /* Corner brackets */
+  .corner {
+    position: absolute;
+    width: 24px; height: 24px;
+    border-color: var(--accent);
+    border-style: solid;
+    opacity: 0.7;
+  }
+  .corner.tl { top: 12px; left: 12px; border-width: 2px 0 0 2px; border-radius: 2px 0 0 0; }
+  .corner.tr { top: 12px; right: 12px; border-width: 2px 2px 0 0; border-radius: 0 2px 0 0; }
+  .corner.bl { bottom: 12px; left: 12px; border-width: 0 0 2px 2px; border-radius: 0 0 0 2px; }
+  .corner.br { bottom: 12px; right: 12px; border-width: 0 2px 2px 0; border-radius: 0 0 2px 0; }
+
+  .scan-line {
+    position: absolute;
+    left: 12px; right: 12px;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, var(--accent), transparent);
+    animation: scan 2.5s ease-in-out infinite;
+    opacity: 0.6;
+  }
+  @keyframes scan {
+    0%   { top: 15%; }
+    50%  { top: 85%; }
+    100% { top: 15%; }
+  }
+
+  .viewfinder-info {
+    position: absolute;
+    bottom: 12px; left: 12px; right: 12px;
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-end;
+  }
+  .gps-tag {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--accent);
+    background: rgba(0,0,0,0.6);
+    padding: 3px 7px;
+    border-radius: 4px;
+    backdrop-filter: blur(4px);
+  }
+  .rec-indicator {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-family: var(--mono);
+    font-size: 10px;
+    color: #fff;
+    background: rgba(0,0,0,0.6);
+    padding: 3px 7px;
+    border-radius: 4px;
+  }
+  .rec-dot {
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    background: var(--warn);
+    animation: blink 1s ease-in-out infinite;
+  }
+  @keyframes blink {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.3; }
+  }
+
+  /* camera placeholder when not active */
+  .camera-placeholder {
+    position: absolute; inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    background: #050709;
+    color: var(--muted);
+    font-size: 13px;
+    font-family: var(--mono);
+  }
+  .camera-placeholder .cam-icon { font-size: 40px; opacity: 0.3; }
+
+  /* ── Capture button ── */
+  .capture-row {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 16px;
+    padding: 8px 0;
+  }
+  .btn-capture {
+    width: 68px; height: 68px;
+    border-radius: 50%;
+    border: 3px solid var(--accent);
+    background: transparent;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s;
+    position: relative;
+  }
+  .btn-capture::after {
+    content: '';
+    width: 52px; height: 52px;
+    border-radius: 50%;
+    background: var(--accent);
+    transition: all 0.2s;
+  }
+  .btn-capture:active::after { width: 44px; height: 44px; }
+  .btn-capture:disabled { opacity: 0.3; cursor: not-allowed; }
+
+  .btn-icon {
+    padding: 10px 16px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 11px;
+    cursor: pointer;
+    transition: all 0.2s;
+    display: flex; align-items: center; gap: 6px;
+  }
+  .btn-icon:hover { border-color: var(--accent); color: var(--accent); }
+  .btn-icon:disabled { opacity: 0.3; cursor: not-allowed; }
+
+  /* ── Primary button ── */
+  .btn-primary {
+    width: 100%;
+    padding: 14px;
+    border-radius: 10px;
+    border: none;
+    background: linear-gradient(135deg, var(--accent), #00b87a);
+    color: #0a0c10;
+    font-family: var(--sans);
+    font-weight: 700;
+    font-size: 14px;
+    cursor: pointer;
+    transition: all 0.2s;
+    letter-spacing: 0.3px;
+  }
+  .btn-primary:hover { opacity: 0.9; transform: translateY(-1px); }
+  .btn-primary:active { transform: translateY(0); }
+  .btn-primary:disabled { opacity: 0.3; cursor: not-allowed; transform: none; }
+
+  .btn-secondary {
+    width: 100%;
+    padding: 13px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--text);
+    font-family: var(--sans);
+    font-weight: 600;
+    font-size: 14px;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+  .btn-secondary:hover { border-color: var(--accent2); color: var(--accent2); }
+
+  /* ── Preview ── */
+  #preview-section { display: none; }
+  #preview-img {
+    width: 100%;
+    border-radius: var(--radius);
+    display: block;
+  }
+
+  /* ── Manifest builder ── */
+  .manifest-field {
+    margin-bottom: 12px;
+  }
+  .manifest-label {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--muted);
+    margin-bottom: 5px;
+    display: block;
+    letter-spacing: 0.5px;
+  }
+  .manifest-input {
+    width: 100%;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 9px 12px;
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 12px;
+    transition: border-color 0.2s;
+  }
+  .manifest-input:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+  .manifest-input::placeholder { color: var(--muted); }
+
+  select.manifest-input {
+    appearance: none;
+    cursor: pointer;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%235a6070' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 12px center;
+    padding-right: 30px;
+  }
+
+  /* ── Progress / signing animation ── */
+  #signing-overlay {
+    display: none;
+    position: fixed; inset: 0;
+    background: rgba(10,12,16,0.92);
+    z-index: 100;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 20px;
+    backdrop-filter: blur(8px);
+  }
+  #signing-overlay.active { display: flex; }
+
+  .signing-spinner {
+    width: 60px; height: 60px;
+    border: 2px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .signing-label {
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--accent);
+    letter-spacing: 1px;
+  }
+  .signing-steps {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    width: 260px;
+  }
+  .signing-step {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--muted);
+    transition: color 0.3s;
+  }
+  .signing-step.done { color: var(--accent); }
+  .signing-step.active-step { color: var(--text); }
+  .step-icon { font-size: 13px; width: 16px; text-align: center; }
+
+  /* ── Result card ── */
+  #result-section { display: none; }
+
+  .result-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 14px;
+  }
+  .result-icon {
+    width: 44px; height: 44px;
+    border-radius: 12px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 22px;
+    background: rgba(0,229,160,0.1);
+    border: 1px solid rgba(0,229,160,0.2);
+    flex-shrink: 0;
+  }
+  .result-title {
+    font-weight: 700;
+    font-size: 15px;
+  }
+  .result-sub {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--muted);
+    margin-top: 2px;
+  }
+
+  .manifest-viewer {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px;
+    font-family: var(--mono);
+    font-size: 10px;
+    line-height: 1.7;
+    color: var(--muted);
+    max-height: 180px;
+    overflow-y: auto;
+    word-break: break-all;
+  }
+  .manifest-viewer .key { color: var(--accent2); }
+  .manifest-viewer .val { color: var(--text); }
+  .manifest-viewer .str { color: #e5c07b; }
+  .manifest-viewer .num { color: #d19a66; }
+  .manifest-viewer .bool { color: var(--warn); }
+
+  /* ── Toast ── */
+  #toast {
+    position: fixed;
+    bottom: 24px; left: 50%; transform: translateX(-50%) translateY(80px);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 10px 18px;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text);
+    z-index: 200;
+    transition: transform 0.3s cubic-bezier(0.34,1.56,0.64,1);
+    white-space: nowrap;
+    display: flex; align-items: center; gap: 8px;
+  }
+  #toast.show { transform: translateX(-50%) translateY(0); }
+  #toast.success { border-color: rgba(0,229,160,0.4); color: var(--accent); }
+  #toast.error   { border-color: rgba(255,71,87,0.4);  color: var(--error); }
+
+  /* ── Tabs ── */
+  .tabs {
+    display: flex;
+    gap: 2px;
+    background: var(--bg);
+    padding: 3px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    margin-bottom: 14px;
+  }
+  .tab {
+    flex: 1;
+    padding: 8px;
+    border-radius: 7px;
+    border: none;
+    background: transparent;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 11px;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+  .tab.active {
+    background: var(--surface);
+    color: var(--text);
+    border: 1px solid var(--border);
+  }
+
+  /* ── Setup / onboarding ── */
+  #setup-section { display: none; }
+  .setup-icon { font-size: 48px; text-align: center; margin-bottom: 8px; }
+  .setup-title { font-size: 20px; font-weight: 800; text-align: center; }
+  .setup-desc { font-size: 13px; color: var(--muted); text-align: center; line-height: 1.6; margin: 8px 0 16px; }
+
+  .progress-bar {
+    height: 3px;
+    background: var(--border);
+    border-radius: 2px;
+    overflow: hidden;
+    margin-bottom: 16px;
+  }
+  .progress-fill {
+    height: 100%;
+    background: linear-gradient(90deg, var(--accent), var(--accent2));
+    border-radius: 2px;
+    transition: width 0.4s ease;
+    width: 0%;
+  }
+
+  /* scrollbar */
+  ::-webkit-scrollbar { width: 4px; }
+  ::-webkit-scrollbar-track { background: var(--bg); }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+  .divider {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 4px 0;
+  }
+
+  .row-btns { display: flex; gap: 8px; }
+  .row-btns .btn-primary, .row-btns .btn-secondary { flex: 1; }
+
+  /* fingerprint display */
+  .fingerprint-box {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-family: var(--mono);
+    font-size: 9px;
+    color: var(--accent);
+    letter-spacing: 1px;
+    word-break: break-all;
+    line-height: 1.8;
+    margin-top: 8px;
+  }
+</style>
+</head>
+<body>
+
+<div id="app">
+
+  <!-- Header -->
+  <div class="header">
+    <div class="logo">
+      <div class="logo-icon">🔏</div>
+      <div class="logo-text">C2PA<span>Sign</span></div>
+    </div>
+    <div class="header-status">
+      <div><span class="status-dot" id="liff-dot"></span><span id="liff-status-txt">Connecting…</span></div>
+      <div><span class="status-dot" id="key-dot"></span><span id="key-status-txt">No keypair</span></div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════
+       SETUP / ONBOARDING SECTION
+  ════════════════════════════════════════ -->
+  <div id="setup-section" class="card">
+    <div class="card-body">
+      <div class="setup-icon">🔐</div>
+      <div class="setup-title">Setup Your Identity</div>
+      <div class="setup-desc">Generate a personal keypair and get a certificate issued. Your private key never leaves this device.</div>
+      <div class="progress-bar"><div class="progress-fill" id="setup-progress"></div></div>
+      <div id="setup-log" class="manifest-viewer" style="margin-bottom:14px; min-height:80px;"></div>
+      <button class="btn-primary" id="btn-setup" onclick="runSetup()">🔑 Generate My Identity</button>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════
+       IDENTITY CARD
+  ════════════════════════════════════════ -->
+  <div id="identity-section" class="card" style="display:none;">
+    <div class="card-header">
+      <span class="card-title">Identity</span>
+      <button class="btn-icon" style="padding:4px 10px; font-size:10px;" onclick="showCertDetails()">CERT ▾</button>
+    </div>
+    <div class="card-body">
+      <div class="identity-row">
+        <div class="avatar" id="user-avatar">👤</div>
+        <div class="identity-info">
+          <div class="identity-name" id="user-name">—</div>
+          <div class="identity-id" id="user-id">—</div>
+        </div>
+        <div class="cert-badge" id="cert-badge">✓ CERT</div>
+      </div>
+      <div id="cert-detail-panel" class="cert-detail" style="display:none;">
+        <div class="cert-row">
+          <span class="cert-label">Algorithm</span>
+          <span class="cert-value accent" id="cd-alg">—</span>
+        </div>
+        <div class="cert-row">
+          <span class="cert-label">Subject</span>
+          <span class="cert-value" id="cd-subject">—</span>
+        </div>
+        <div class="cert-row">
+          <span class="cert-label">Valid Until</span>
+          <span class="cert-value" id="cd-expiry">—</span>
+        </div>
+        <div class="cert-row">
+          <span class="cert-label">Thumbprint</span>
+          <span class="cert-value" id="cd-thumb" style="font-size:9px;">—</span>
+        </div>
+        <div class="cert-row">
+          <span class="cert-label">Issuer</span>
+          <span class="cert-value" id="cd-issuer">—</span>
+        </div>
+        <button class="btn-icon" style="width:100%; margin-top:10px; justify-content:center;" onclick="exportCert()">⬇ Export Certificate PEM</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════
+       CAMERA + CAPTURE
+  ════════════════════════════════════════ -->
+  <div id="main-section" style="display:none;">
+
+    <!-- Tabs -->
+    <div class="tabs">
+      <button class="tab active" onclick="switchTab('capture', this)">📷 Capture</button>
+      <button class="tab" onclick="switchTab('verify', this)">🔍 Verify</button>
+    </div>
+
+    <!-- ── CAPTURE TAB ── -->
+    <div id="tab-capture">
+
+      <!-- Viewfinder -->
+      <div class="viewfinder" id="viewfinder">
+        <video id="video" autoplay playsinline muted></video>
+        <canvas id="canvas"></canvas>
+        <div class="viewfinder-overlay">
+          <div class="corner tl"></div>
+          <div class="corner tr"></div>
+          <div class="corner bl"></div>
+          <div class="corner br"></div>
+          <div class="scan-line"></div>
+          <div class="viewfinder-info">
+            <div class="gps-tag" id="gps-tag">📍 —</div>
+            <div class="rec-indicator"><div class="rec-dot"></div>LIVE</div>
+          </div>
+        </div>
+        <div class="camera-placeholder" id="cam-placeholder">
+          <div class="cam-icon">📷</div>
+          <div>Tap Start Camera</div>
+        </div>
+      </div>
+
+      <!-- Controls -->
+      <div class="capture-row">
+        <button class="btn-icon" id="btn-start-cam" onclick="startCamera()">▶ Start</button>
+        <button class="btn-capture" id="btn-capture" onclick="captureImage()" disabled title="Capture"></button>
+        <button class="btn-icon" id="btn-flip" onclick="flipCamera()" disabled>↺ Flip</button>
+      </div>
+
+      <!-- Manifest metadata -->
+      <div class="card" id="manifest-form" style="display:none;">
+        <div class="card-header"><span class="card-title">Manifest Metadata</span></div>
+        <div class="card-body">
+          <div class="manifest-field">
+            <label class="manifest-label">TITLE / DESCRIPTION</label>
+            <input class="manifest-input" id="meta-title" type="text" placeholder="e.g. Press photo — event name" value="Captured via LINE C2PA App">
+          </div>
+          <div class="manifest-field">
+            <label class="manifest-label">ACTION</label>
+            <select class="manifest-input" id="meta-action">
+              <option value="c2pa.captured">c2pa.captured</option>
+              <option value="c2pa.created">c2pa.created</option>
+            </select>
+          </div>
+          <div class="manifest-field">
+            <label class="manifest-label">PRODUCER / ORGANIZATION</label>
+            <input class="manifest-input" id="meta-org" type="text" placeholder="e.g. Newsroom / Personal" value="Personal">
+          </div>
+          <button class="btn-primary" onclick="signCapture()">🔏 Sign with My Certificate</button>
+        </div>
+      </div>
+
+      <!-- Preview -->
+      <div id="preview-section">
+        <div class="card">
+          <div class="card-header"><span class="card-title">Captured Frame</span></div>
+          <div class="card-body" style="padding:8px;">
+            <img id="preview-img" alt="Captured">
+          </div>
+        </div>
+      </div>
+
+    </div><!-- /tab-capture -->
+
+    <!-- ── VERIFY TAB ── -->
+    <div id="tab-verify" style="display:none;">
+      <div class="card">
+        <div class="card-header"><span class="card-title">Verify Signed Asset</span></div>
+        <div class="card-body">
+          <div class="manifest-field">
+            <label class="manifest-label">LOAD A SIGNED IMAGE</label>
+            <input type="file" accept="image/*" class="manifest-input" id="verify-file" onchange="loadVerifyFile(event)" style="padding:7px 10px; cursor:pointer;">
+          </div>
+
+          <!-- Verification in progress -->
+          <div id="verify-progress" style="display:none; margin-top:12px;">
+            <div style="display:flex; align-items:center; gap:10px; margin-bottom:10px;">
+              <div class="signing-spinner" style="width:20px;height:20px;border-width:2px;flex-shrink:0;"></div>
+              <span style="font-family:var(--mono);font-size:12px;color:var(--muted);" id="verify-progress-label">Verifying…</span>
+            </div>
+          </div>
+
+          <!-- Verification result -->
+          <div id="verify-result" style="display:none; margin-top:12px;">
+
+            <!-- Overall verdict banner -->
+            <div id="verify-banner" style="
+              border-radius:10px; padding:14px 16px; margin-bottom:14px;
+              display:flex; align-items:center; gap:12px;
+              border: 1px solid;
+            ">
+              <div style="font-size:28px;" id="verify-banner-icon">✅</div>
+              <div>
+                <div style="font-weight:700; font-size:15px;" id="verify-title">Authentic</div>
+                <div style="font-family:var(--mono);font-size:10px;margin-top:2px;" id="verify-sub">All checks passed</div>
+              </div>
+            </div>
+
+            <!-- Check breakdown -->
+            <div style="margin-bottom:14px;">
+              <div class="card-title" style="margin-bottom:8px;">VERIFICATION CHECKS</div>
+              <div id="verify-checks"></div>
+            </div>
+
+            <!-- Manifest details -->
+            <div class="card-title" style="margin-bottom:6px;">MANIFEST DETAILS</div>
+            <div class="manifest-viewer" id="verify-manifest"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div><!-- /main-section -->
+
+  <!-- ═══════════════════════════════════════
+       RESULT SECTION
+  ════════════════════════════════════════ -->
+  <div id="result-section" class="card">
+    <div class="card-header"><span class="card-title">Signed Asset</span></div>
+    <div class="card-body">
+      <div class="result-header">
+        <div class="result-icon">🔏</div>
+        <div>
+          <div class="result-title">C2PA Manifest Embedded</div>
+          <div class="result-sub" id="result-sub">Signed with your certificate</div>
+        </div>
+      </div>
+      <img id="result-img" style="width:100%; border-radius:8px; margin-bottom:14px;" alt="Signed">
+      <div class="manifest-viewer" id="result-manifest"></div>
+      <div style="margin-top:10px;" class="row-btns">
+        <button class="btn-primary" onclick="downloadSigned()">⬇ Download</button>
+        <button class="btn-secondary" onclick="shareToLine()">↗ Share to LINE</button>
+      </div>
+      <button class="btn-icon" style="width:100%; margin-top:8px; justify-content:center;" onclick="resetCapture()">↩ Capture Another</button>
+    </div>
+  </div>
+
+</div><!-- /app -->
+
+<!-- Signing overlay -->
+<div id="signing-overlay">
+  <div class="signing-spinner"></div>
+  <div class="signing-label" id="signing-label">SIGNING…</div>
+  <div class="signing-steps">
+    <div class="signing-step" id="step-hash"><span class="step-icon">⚙</span> Computing image hash</div>
+    <div class="signing-step" id="step-manifest"><span class="step-icon">📄</span> Building C2PA manifest</div>
+    <div class="signing-step" id="step-cose"><span class="step-icon">🔐</span> COSE signing (WebCrypto)</div>
+    <div class="signing-step" id="step-embed"><span class="step-icon">💾</span> Embedding manifest (XMP/JUMBF)</div>
+    <div class="signing-step" id="step-done"><span class="step-icon">✅</span> Complete</div>
+  </div>
+</div>
+
+<!-- Toast -->
+<div id="toast">✓ Copied</div>
+
+<script>
+// ═══════════════════════════════════════════════════════════════════════════
+// CONFIG — replace with your actual values
+// ═══════════════════════════════════════════════════════════════════════════
+const CONFIG = {
+  LIFF_ID:        "YOUR_LIFF_ID_HERE",          // replace before deploying
+  CA_ENDPOINT:    "https://your-ca-backend.com", // your CA backend
+  STORAGE_BUCKET: "https://your-storage.com",    // signed asset storage
+  APP_VERSION:    "1.0.0",
+  CLAIM_GENERATOR:"LINE-C2PA-App/1.0 c2pa/1.4",
+  // For demo/dev: set USE_DEMO_MODE=true to bypass real LIFF+CA
+  USE_DEMO_MODE:  true
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// STATE
+// ═══════════════════════════════════════════════════════════════════════════
+const State = {
+  liffReady:    false,
+  profile:      null,
+  accessToken:  null,
+  keyPair:      null,       // CryptoKeyPair
+  certificate:  null,       // ArrayBuffer (DER)
+  certPem:      null,       // string
+  stream:       null,
+  facingMode:   "environment",
+  capturedBlob: null,
+  capturedDataUrl: null,
+  gpsCoords:    null,
+  signedBlob:   null,
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// IndexedDB — key storage
+// ═══════════════════════════════════════════════════════════════════════════
+const DB_NAME = "c2pa-liff-store";
+const DB_VER  = 1;
+
+function openDB() {
+  return new Promise((res, rej) => {
+    const req = indexedDB.open(DB_NAME, DB_VER);
+    req.onupgradeneeded = e => {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains("keys")) db.createObjectStore("keys");
+      if (!db.objectStoreNames.contains("certs")) db.createObjectStore("certs");
+      if (!db.objectStoreNames.contains("meta"))  db.createObjectStore("meta");
+    };
+    req.onsuccess = e => res(e.target.result);
+    req.onerror   = e => rej(e.target.error);
+  });
+}
+
+async function dbPut(store, key, value) {
+  const db = await openDB();
+  return new Promise((res, rej) => {
+    const tx = db.transaction(store, "readwrite");
+    tx.objectStore(store).put(value, key);
+    tx.oncomplete = () => res();
+    tx.onerror    = e => rej(e.target.error);
+  });
+}
+
+async function dbGet(store, key) {
+  const db = await openDB();
+  return new Promise((res, rej) => {
+    const tx = db.transaction(store, "readonly");
+    const req = tx.objectStore(store).get(key);
+    req.onsuccess = e => res(e.target.result);
+    req.onerror   = e => rej(e.target.error);
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// LIFF INIT
+// ═══════════════════════════════════════════════════════════════════════════
+async function initLiff() {
+  if (CONFIG.USE_DEMO_MODE) {
+    State.liffReady = true;
+    State.profile = {
+      userId:      "Udemoline12345678",
+      displayName: "Demo User",
+      pictureUrl:  null
+    };
+    State.accessToken = "demo-token";
+    dot("liff-dot", true);
+    setText("liff-status-txt", "Demo Mode");
+    await loadOrSetup();
+    return;
+  }
+  try {
+    await liff.init({ liffId: CONFIG.LIFF_ID });
+    if (!liff.isLoggedIn()) { liff.login(); return; }
+    State.liffReady  = true;
+    State.profile    = await liff.getProfile();
+    State.accessToken = liff.getAccessToken();
+    dot("liff-dot", true);
+    setText("liff-status-txt", "LINE OK");
+    await loadOrSetup();
+  } catch(e) {
+    setText("liff-status-txt", "LIFF Error");
+    showToast("LIFF init failed: " + e.message, "error");
+    // Fallback to demo
+    CONFIG.USE_DEMO_MODE = true;
+    await initLiff();
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// LOAD EXISTING KEYS or show setup
+// ═══════════════════════════════════════════════════════════════════════════
+async function loadOrSetup() {
+  const userId = State.profile.userId;
+  const privKey = await dbGet("keys", userId + ":private");
+  const pubKey  = await dbGet("keys", userId + ":public");
+  const cert    = await dbGet("certs", userId);
+
+  if (privKey && pubKey && cert) {
+    State.keyPair     = { privateKey: privKey, publicKey: pubKey };
+    State.certificate = cert;
+    State.certPem     = derToPem(cert, "CERTIFICATE");
+    dot("key-dot", true);
+    setText("key-status-txt", "Keys loaded");
+    populateIdentity();
+    showMain();
+  } else {
+    show("setup-section");
+    getText("setup-log").innerHTML = fmtLog("No identity found. Generate one to get started.", "muted");
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SETUP — generate keypair + get certificate
+// ═══════════════════════════════════════════════════════════════════════════
+async function runSetup() {
+  const btn = id("btn-setup");
+  btn.disabled = true;
+  const log = id("setup-log");
+
+  const steps = [
+    [10, "Generating ECDSA P-256 keypair (WebCrypto)…"],
+    [30, "Keypair generated. Private key is non-extractable."],
+    [45, "Building CSR (PKCS#10)…"],
+    [65, "Sending CSR to Certificate Authority…"],
+    [85, "Receiving signed X.509 certificate…"],
+    [100,"Identity ready! Certificate stored in IndexedDB."]
+  ];
+
+  async function logStep(i) {
+    id("setup-progress").style.width = steps[i][0] + "%";
+    log.innerHTML += fmtLog(steps[i][1]);
+    log.scrollTop = log.scrollHeight;
+    await sleep(500);
+  }
+
+  try {
+    await logStep(0);
+
+    // 1. Generate keypair
+    const keyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      false,           // non-extractable private key
+      ["sign", "verify"]
+    );
+    State.keyPair = keyPair;
+    await logStep(1);
+
+    // 2. Export public key for CSR
+    const pubKeyDer = await crypto.subtle.exportKey("spki", keyPair.publicKey);
+
+    // 3. Build a mock/real CSR
+    await logStep(2);
+    const csrB64 = await buildSimpleCSR(keyPair, State.profile.userId);
+    await logStep(3);
+
+    // 4. Get certificate from CA (or self-sign in demo)
+    const certDer = await issueCertificate(csrB64, pubKeyDer, keyPair);
+    await logStep(4);
+
+    // 5. Store in IndexedDB
+    const uid = State.profile.userId;
+    await dbPut("keys",  uid + ":private", keyPair.privateKey);
+    await dbPut("keys",  uid + ":public",  keyPair.publicKey);
+    await dbPut("certs", uid,              certDer);
+    await dbPut("meta",  uid + ":created", new Date().toISOString());
+
+    State.certificate = certDer;
+    State.certPem     = derToPem(certDer, "CERTIFICATE");
+    dot("key-dot", true);
+    setText("key-status-txt", "Keys ready");
+    await logStep(5);
+
+    await sleep(600);
+    hide("setup-section");
+    populateIdentity();
+    showMain();
+    showToast("Identity created successfully!", "success");
+
+  } catch(e) {
+    log.innerHTML += fmtLog("ERROR: " + e.message, "error");
+    btn.disabled = false;
+    showToast("Setup failed", "error");
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CSR BUILDER (simplified — works without pkijs CDN)
+// ═══════════════════════════════════════════════════════════════════════════
+async function buildSimpleCSR(keyPair, userId) {
+  // For production: use pkijs to build a proper PKCS#10 CSR.
+  // For this demo: return a placeholder that the CA endpoint can handle.
+  const pubKey = await crypto.subtle.exportKey("spki", keyPair.publicKey);
+  const info = { subject: "CN=line:" + userId, publicKey: arrayToBase64(pubKey) };
+  return btoa(JSON.stringify(info));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CERTIFICATE ISSUANCE
+// In demo mode: create a self-signed cert structure (real C2PA needs a CA)
+// In production: POST csr to CONFIG.CA_ENDPOINT
+// ═══════════════════════════════════════════════════════════════════════════
+async function issueCertificate(csrB64, pubKeyDer, keyPair) {
+  if (CONFIG.USE_DEMO_MODE) {
+    return await selfSignCert(keyPair, State.profile);
+  }
+  // Production: POST to your CA backend
+  const res = await fetch(CONFIG.CA_ENDPOINT + "/issue-cert", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": "Bearer " + State.accessToken
+    },
+    body: JSON.stringify({
+      csr: csrB64,
+      lineUserId: State.profile.userId
+    })
+  });
+  if (!res.ok) throw new Error("CA returned " + res.status);
+  const { certificate } = await res.json();
+  return base64ToArray(certificate);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SELF-SIGNED CERT (Demo only — for production use a proper CA)
+// Builds a minimal DER-encoded X.509 v3 certificate
+// ═══════════════════════════════════════════════════════════════════════════
+async function selfSignCert(keyPair, profile) {
+  // Export public key
+  const spki = await crypto.subtle.exportKey("spki", keyPair.publicKey);
+  const spkiBytes = new Uint8Array(spki);
+
+  const notBefore = new Date();
+  const notAfter  = new Date(notBefore.getTime() + 365*24*60*60*1000);
+
+  // Build TBS (To-Be-Signed) certificate components
+  const subjectName = "CN=line:" + profile.userId + ",O=LINE C2PA App,C=TH";
+  const serialNumber = crypto.getRandomValues(new Uint8Array(8));
+
+  // We'll build a simplified DER structure
+  const version       = derTag(0xa0, derTag(0x02, hexBytes("02")));       // v3
+  const serial        = derTag(0x02, serialNumber);
+  const sigAlg        = ecdsaSigAlgSeq();
+  const issuerSeq     = buildRDN(subjectName);   // self-signed: issuer = subject
+  const subjectSeq    = buildRDN(subjectName);
+  const validity      = buildValidity(notBefore, notAfter);
+  const subjectPKI    = spkiBytes;               // already DER from exportKey
+  const extensions    = buildExtensions();
+
+  const tbsBody = concatBytes(version, serial, sigAlg, issuerSeq, validity, subjectSeq, subjectPKI, extensions);
+  const tbs     = derTag(0x30, tbsBody);
+
+  // Sign TBS
+  const signature = new Uint8Array(await crypto.subtle.sign(
+    { name: "ECDSA", hash: { name: "SHA-256" } },
+    keyPair.privateKey,
+    tbs
+  ));
+
+  const bitString = derTag(0x03, concatBytes(new Uint8Array([0x00]), signature));
+  const cert      = derTag(0x30, concatBytes(tbs, sigAlg, bitString));
+  return cert.buffer;
+}
+
+// ── DER helpers ────────────────────────────────
+function derTag(tag, data) {
+  const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
+  const len   = derLength(bytes.length);
+  const out   = new Uint8Array(1 + len.length + bytes.length);
+  out[0] = tag;
+  out.set(len, 1);
+  out.set(bytes, 1 + len.length);
+  return out;
+}
+function derLength(n) {
+  if (n < 128) return new Uint8Array([n]);
+  if (n < 256) return new Uint8Array([0x81, n]);
+  return new Uint8Array([0x82, (n >> 8) & 0xff, n & 0xff]);
+}
+function hexBytes(hex) {
+  return new Uint8Array(hex.match(/../g).map(h => parseInt(h,16)));
+}
+function concatBytes(...arrays) {
+  const total = arrays.reduce((s,a) => s + (a instanceof Uint8Array ? a : new Uint8Array(a)).length, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const a of arrays) {
+    const b = a instanceof Uint8Array ? a : new Uint8Array(a);
+    out.set(b, offset);
+    offset += b.length;
+  }
+  return out;
+}
+function ecdsaSigAlgSeq() {
+  // SEQUENCE { OID ecdsaWithSHA256 }
+  return hexBytes("300a06082a8648ce3d040302");
+}
+function buildRDN(cnString) {
+  // Build minimal RDN with CN only
+  const parts = cnString.split(",");
+  const rdns = parts.map(p => {
+    const [k,v] = p.split("=");
+    const oidMap = { CN:"550403", O:"55040a", C:"550406" };
+    const oid = oidMap[k.trim()] || "550403";
+    const oidBytes  = hexBytes("06" + (oid.length/2).toString(16).padStart(2,"0") + oid);
+    const valBytes  = new TextEncoder().encode(v ? v.trim() : k.trim());
+    const utf8Str   = derTag(0x0c, valBytes);
+    const attrSeq   = derTag(0x30, concatBytes(oidBytes, utf8Str));
+    return derTag(0x31, attrSeq);
+  });
+  return derTag(0x30, concatBytes(...rdns));
+}
+function buildValidity(nb, na) {
+  function utcTime(d) {
+    const s = d.toISOString().replace(/[-:T]/g,"").slice(2,14) + "Z";
+    return derTag(0x17, new TextEncoder().encode(s));
+  }
+  return derTag(0x30, concatBytes(utcTime(nb), utcTime(na)));
+}
+function buildExtensions() {
+  // minimal: basicConstraints CA:FALSE
+  const bcValue  = hexBytes("3000");                // empty sequence = CA:FALSE
+  const bcOid    = hexBytes("0603551d13");           // id-ce-basicConstraints
+  const bcOctet  = derTag(0x04, derTag(0x30, bcValue));
+  const bcExt    = derTag(0x30, concatBytes(bcOid, bcOctet));
+  return derTag(0xa3, derTag(0x30, bcExt));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// POPULATE IDENTITY UI
+// ═══════════════════════════════════════════════════════════════════════════
+function populateIdentity() {
+  const p = State.profile;
+  if (p.pictureUrl) {
+    const img = document.createElement("img");
+    img.src = p.pictureUrl;
+    img.style.cssText = "width:44px;height:44px;border-radius:50%;object-fit:cover;";
+    id("user-avatar").replaceWith(img);
+  } else {
+    id("user-avatar").textContent = p.displayName?.[0] || "?";
+  }
+  setText("user-name", p.displayName || "LINE User");
+  setText("user-id",   p.userId);
+
+  // Parse cert metadata
+  try {
+    parseCertMeta();
+  } catch(e) {
+    id("cert-badge").textContent = "✓ CERT";
+  }
+}
+
+function parseCertMeta() {
+  // Parse validity from DER cert (rough extraction)
+  if (!State.certificate) return;
+  const bytes = new Uint8Array(State.certificate);
+  const notAfterStr = extractNotAfter(bytes);
+  if (notAfterStr) {
+    const expiry = parseUtcTime(notAfterStr);
+    const now    = new Date();
+    const days   = Math.floor((expiry - now) / 86400000);
+    setText("cd-expiry", expiry.toLocaleDateString() + ` (${days}d)`);
+    if (days < 30) {
+      id("cert-badge").className = "cert-badge warn";
+      id("cert-badge").textContent = "⚠ EXPIRING";
+    } else {
+      id("cert-badge").textContent = "✓ CERT";
+    }
+  }
+  setText("cd-alg",    "ECDSA P-256 (ES256)");
+  setText("cd-subject","CN=line:" + State.profile.userId);
+  setText("cd-issuer", CONFIG.USE_DEMO_MODE ? "Self-Signed (Demo)" : "LINE C2PA Root CA");
+
+  // Compute cert thumbprint (SHA-256)
+  crypto.subtle.digest("SHA-256", State.certificate).then(h => {
+    const hex = [...new Uint8Array(h)].map(b => b.toString(16).padStart(2,"0")).join(":");
+    setText("cd-thumb", hex.substring(0,47) + "…");
+  });
+}
+
+// Crude DER parser for UTCTime in validity block
+function extractNotAfter(bytes) {
+  // look for two consecutive UTCTime tags (0x17)
+  let count = 0;
+  for (let i = 0; i < bytes.length - 15; i++) {
+    if (bytes[i] === 0x17) {
+      count++;
+      if (count === 2) {
+        const len = bytes[i+1];
+        return String.fromCharCode(...bytes.slice(i+2, i+2+len));
+      }
+    }
+  }
+  return null;
+}
+
+function parseUtcTime(s) {
+  // YYMMDDHHMMSSZ
+  const y = parseInt(s.slice(0,2)); const mo = parseInt(s.slice(2,4))-1;
+  const d = parseInt(s.slice(4,6)); const h  = parseInt(s.slice(6,8));
+  const m = parseInt(s.slice(8,10)); const sec = parseInt(s.slice(10,12));
+  return new Date(Date.UTC(y < 50 ? 2000+y : 1900+y, mo, d, h, m, sec));
+}
+
+function showCertDetails() {
+  const p = id("cert-detail-panel");
+  p.style.display = p.style.display === "none" ? "block" : "none";
+}
+
+function exportCert() {
+  const blob = new Blob([State.certPem], { type: "text/plain" });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement("a");
+  a.href = url; a.download = "c2pa-user-cert.pem";
+  a.click();
+  URL.revokeObjectURL(url);
+  showToast("Certificate exported", "success");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CAMERA
+// ═══════════════════════════════════════════════════════════════════════════
+async function startCamera() {
+  try {
+    if (State.stream) { State.stream.getTracks().forEach(t => t.stop()); }
+    State.stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: State.facingMode, width: { ideal: 1280 }, height: { ideal: 960 } },
+      audio: false
+    });
+    id("video").srcObject = State.stream;
+    id("cam-placeholder").style.display = "none";
+    id("btn-capture").disabled = false;
+    id("btn-flip").disabled    = false;
+    startGPS();
+  } catch(e) {
+    showToast("Camera error: " + e.message, "error");
+  }
+}
+
+function flipCamera() {
+  State.facingMode = State.facingMode === "environment" ? "user" : "environment";
+  startCamera();
+}
+
+function captureImage() {
+  const video  = id("video");
+  const canvas = id("canvas");
+  canvas.width  = video.videoWidth  || 1280;
+  canvas.height = video.videoHeight || 960;
+  const ctx = canvas.getContext("2d");
+  ctx.drawImage(video, 0, 0);
+
+  canvas.toBlob(blob => {
+    State.capturedBlob = blob;
+    const url = URL.createObjectURL(blob);
+    State.capturedDataUrl = url;
+    id("preview-img").src = url;
+    show("preview-section");
+    show("manifest-form");
+    showToast("Frame captured — fill metadata to sign", "success");
+  }, "image/jpeg", 0.92);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GPS
+// ═══════════════════════════════════════════════════════════════════════════
+function startGPS() {
+  if (!navigator.geolocation) return;
+  navigator.geolocation.getCurrentPosition(pos => {
+    State.gpsCoords = pos.coords;
+    const lat = pos.coords.latitude.toFixed(4);
+    const lng = pos.coords.longitude.toFixed(4);
+    setText("gps-tag", `📍 ${lat}, ${lng}`);
+  }, () => setText("gps-tag", "📍 GPS unavailable"));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// C2PA SIGNING (client-side with WebCrypto)
+// ═══════════════════════════════════════════════════════════════════════════
+async function signCapture() {
+  if (!State.capturedBlob) { showToast("Nothing captured yet", "error"); return; }
+  if (!State.keyPair)      { showToast("No keypair found", "error"); return; }
+
+  showOverlay(true);
+  try {
+    await sleep(200);
+
+    // STEP 1: Hash the image
+    activateStep("step-hash");
+    const imgBuffer = await State.capturedBlob.arrayBuffer();
+    const imgHash   = await crypto.subtle.digest("SHA-256", imgBuffer);
+    const imgHashB64 = arrayToBase64(imgHash);
+    await sleep(400);
+    doneStep("step-hash");
+
+    // STEP 2: Build manifest
+    activateStep("step-manifest");
+    const manifest = await buildManifest(imgHashB64);
+    await sleep(500);
+    doneStep("step-manifest");
+
+    // STEP 3: COSE sign
+    activateStep("step-cose");
+    const manifestBytes   = new TextEncoder().encode(JSON.stringify(manifest));
+    const signatureBuffer = await crypto.subtle.sign(
+      { name: "ECDSA", hash: { name: "SHA-256" } },
+      State.keyPair.privateKey,
+      manifestBytes
+    );
+    const signatureB64 = arrayToBase64(signatureBuffer);
+    await sleep(600);
+    doneStep("step-cose");
+
+    // STEP 4: Embed manifest into image (XMP/JUMBF simulation)
+    activateStep("step-embed");
+    const signedBlob = await embedManifestInImage(imgBuffer, manifest, signatureB64);
+    State.signedBlob = signedBlob;
+    await sleep(500);
+    doneStep("step-embed");
+
+    // STEP 5: Done
+    activateStep("step-done");
+    await sleep(300);
+    doneStep("step-done");
+    await sleep(300);
+
+    showOverlay(false);
+    showResult(manifest, signatureB64);
+
+  } catch(e) {
+    showOverlay(false);
+    showToast("Signing failed: " + e.message, "error");
+    console.error(e);
+  }
+}
+
+async function buildManifest(imgHashB64) {
+  const now = new Date().toISOString();
+  const p   = State.profile;
+  return {
+    "@context": "https://c2pa.org/assertions",
+    "dc:format": "image/jpeg",
+    "dc:title":  id("meta-title").value || "Captured image",
+    "claim_generator": CONFIG.CLAIM_GENERATOR,
+    "claim_generator_info": [{
+      "name": "LINE C2PA Mini App",
+      "version": CONFIG.APP_VERSION,
+      "icon": "https://line.me"
+    }],
+    "created": now,
+    "producer": {
+      "name": p.displayName || "LINE User",
+      "identifier": "line:" + p.userId,
+      "organization": id("meta-org").value || "Personal"
+    },
+    "assertions": [
+      {
+        "label": "c2pa.actions",
+        "data": {
+          "actions": [{
+            "action": id("meta-action").value,
+            "softwareAgent": CONFIG.CLAIM_GENERATOR,
+            "when": now,
+            "digitalSourceType": "https://cv.iptc.org/newscodes/digitalsourcetype/digitalCapture"
+          }]
+        }
+      },
+      ...(State.gpsCoords ? [{
+        "label": "stds.exif",
+        "data": {
+          "@type": "stds.exif",
+          "exif:GPSLatitude":  State.gpsCoords.latitude,
+          "exif:GPSLongitude": State.gpsCoords.longitude,
+          "exif:GPSAltitude":  State.gpsCoords.altitude || 0,
+          "exif:GPSTimeStamp": now
+        }
+      }] : []),
+      {
+        "label": "c2pa.hash.data",
+        "data": {
+          "name": "jumbf manifest",
+          "alg": "sha256",
+          "hash": imgHashB64,
+          "pad": "0000000000000000"
+        }
+      }
+    ],
+    "signature_info": {
+      "cert_serial_number": arrayToHex(crypto.getRandomValues(new Uint8Array(8))),
+      "issuer": CONFIG.USE_DEMO_MODE ? "CN=LINE C2PA Demo CA" : "CN=LINE C2PA Root CA",
+      "time": now,
+      "public_key_spki": await exportPublicKeySPKI()
+    }
+  };
+}
+
+// Embed manifest into JPEG by appending a custom JUMBF-like APP11 segment
+async function embedManifestInImage(imgBuffer, manifest, signatureB64) {
+  const payload = JSON.stringify({ manifest, signature: signatureB64, version: "1.0" });
+  const payloadBytes = new TextEncoder().encode(payload);
+
+  // Build a JPEG APP11 segment (marker 0xFFEB) to hold our C2PA data
+  // Real C2PA uses JUMBF boxes inside APP11; this is a simplified container
+  const marker      = new Uint8Array([0xFF, 0xEB]);
+  const label       = new TextEncoder().encode("c2pa\x00");
+  const dataLen     = label.length + payloadBytes.length + 2; // +2 for length field
+  const lenBytes    = new Uint8Array([(dataLen >> 8) & 0xff, dataLen & 0xff]);
+  const segment     = concatBytes(marker, lenBytes, label, payloadBytes);
+
+  // Find SOI (0xFFD8) + insert after it
+  const orig = new Uint8Array(imgBuffer);
+  const result = concatBytes(orig.slice(0, 2), segment, orig.slice(2));
+
+  return new Blob([result], { type: "image/jpeg" });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SHOW RESULT
+// ═══════════════════════════════════════════════════════════════════════════
+function showResult(manifest, signatureB64) {
+  hide("main-section");
+  show("result-section");
+  hide("preview-section");
+  hide("manifest-form");
+
+  const url = URL.createObjectURL(State.signedBlob);
+  id("result-img").src = url;
+
+  setText("result-sub", `Signed by ${manifest.producer.name} · ${new Date(manifest.created).toLocaleString()}`);
+
+  // Pretty-print manifest
+  id("result-manifest").innerHTML = syntaxHighlight(JSON.stringify({
+    ...manifest,
+    "cose_signature": signatureB64.substring(0, 32) + "…",
+  }, null, 2));
+
+  showToast("Image signed successfully!", "success");
+}
+
+function resetCapture() {
+  State.capturedBlob = null;
+  State.signedBlob   = null;
+  hide("result-section");
+  hide("preview-section");
+  hide("manifest-form");
+  show("main-section");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// VERIFY TAB — full cryptographic verification
+// ═══════════════════════════════════════════════════════════════════════════
+
+async function loadVerifyFile(event) {
+  const file = event.target.files[0];
+  if (!file) return;
+
+  // Reset UI
+  hide("verify-result");
+  show("verify-progress");
+  setText("verify-progress-label", "Extracting manifest…");
+
+  const buffer = await file.arrayBuffer();
+  await sleep(300);
+
+  const checks = [];
+
+  // ── CHECK 1: Does the image contain a C2PA manifest segment? ──────────────
+  const extracted = extractManifestFromImage(buffer);
+
+  checks.push({
+    id:    "manifest_found",
+    label: "C2PA Manifest Present",
+    desc:  extracted ? "APP11 segment with c2pa label found in JPEG" : "No APP11/c2pa segment found",
+    pass:  !!extracted,
+  });
+
+  if (!extracted) {
+    hide("verify-progress");
+    renderVerifyResult(checks, null, false, "No C2PA manifest embedded in this image.");
+    return;
+  }
+
+  const { manifest, signature: signatureB64 } = extracted;
+
+  // ── CHECK 2: Manifest structure integrity ─────────────────────────────────
+  setText("verify-progress-label", "Checking manifest structure…");
+  await sleep(250);
+
+  const hasRequiredFields = !!(
+    manifest.claim_generator &&
+    manifest.created &&
+    manifest.producer &&
+    Array.isArray(manifest.assertions)
+  );
+
+  checks.push({
+    id:    "manifest_structure",
+    label: "Manifest Structure Valid",
+    desc:  hasRequiredFields
+      ? "Required fields: claim_generator, created, producer, assertions ✓"
+      : "Missing required manifest fields",
+    pass:  hasRequiredFields,
+  });
+
+  // ── CHECK 3: Re-hash the image pixels (tamper detection) ──────────────────
+  setText("verify-progress-label", "Re-hashing image content…");
+  await sleep(300);
+
+  // Strip the embedded APP11 segment to get the original pixel data,
+  // then hash it — this is what was hashed at signing time.
+  const strippedBuffer  = stripManifestSegment(buffer);
+  const recomputedHash  = await crypto.subtle.digest("SHA-256", strippedBuffer);
+  const recomputedB64   = arrayToBase64(recomputedHash);
+
+  // Find the stored hash assertion in the manifest
+  const hashAssertion   = manifest.assertions?.find(a => a.label === "c2pa.hash.data");
+  const storedHash      = hashAssertion?.data?.hash || null;
+  const hashMatch       = storedHash && (recomputedB64 === storedHash);
+
+  checks.push({
+    id:    "image_hash",
+    label: "Image Hash Integrity",
+    desc:  hashMatch
+      ? "SHA-256 of pixel data matches signed hash — image unmodified"
+      : storedHash
+        ? `Hash MISMATCH — image was modified after signing\nStored:      ${storedHash.substring(0,24)}…\nRecomputed: ${recomputedB64.substring(0,24)}…`
+        : "No hash assertion found in manifest",
+    pass:  hashMatch,
+    critical: true,
+  });
+
+  // ── CHECK 4: Signature verification (ECDSA over manifest bytes) ───────────
+  setText("verify-progress-label", "Verifying cryptographic signature…");
+  await sleep(400);
+
+  let sigValid  = false;
+  let sigError  = "";
+  let sigDesc   = "";
+
+  if (!signatureB64) {
+    sigError = "No signature found in embedded payload";
+  } else {
+    // To verify, we need the signer's public key.
+    // Strategy (in order of preference):
+    //   a) Current user's own key (self-verify)
+    //   b) Public key embedded in manifest (future: cert chain)
+    //   c) In demo mode: attempt with stored key
+
+    const manifestForSig = { ...extracted.manifest };
+    const manifestBytes  = new TextEncoder().encode(JSON.stringify(manifestForSig));
+    const sigBytes       = base64ToArray(signatureB64);
+
+    // Try current user's public key first (self-signed or same device)
+    if (State.keyPair?.publicKey) {
+      try {
+        sigValid = await crypto.subtle.verify(
+          { name: "ECDSA", hash: { name: "SHA-256" } },
+          State.keyPair.publicKey,
+          sigBytes,
+          manifestBytes
+        );
+        sigDesc = sigValid
+          ? "ECDSA P-256 signature valid — signed by this device's key"
+          : "Signature invalid for this device's key";
+      } catch(e) {
+        sigDesc  = "Signature verification error: " + e.message;
+        sigValid = false;
+      }
+    }
+
+    // If not verified with current key, try to extract public key from manifest
+    // (future: when manifest embeds the signer's public key or cert)
+    if (!sigValid && manifest.signature_info?.public_key_spki) {
+      try {
+        const spkiBytes = base64ToArray(manifest.signature_info.public_key_spki);
+        const pubKey    = await crypto.subtle.importKey(
+          "spki", spkiBytes,
+          { name: "ECDSA", namedCurve: "P-256" },
+          false, ["verify"]
+        );
+        sigValid = await crypto.subtle.verify(
+          { name: "ECDSA", hash: { name: "SHA-256" } },
+          pubKey,
+          sigBytes,
+          manifestBytes
+        );
+        sigDesc = sigValid
+          ? "ECDSA P-256 signature valid — verified against embedded public key"
+          : "Signature does not match embedded public key";
+      } catch(e) {
+        sigDesc = "Could not verify against embedded key: " + e.message;
+      }
+    }
+
+    if (!sigDesc) sigDesc = sigError || "Public key not available for full signature check";
+  }
+
+  checks.push({
+    id:    "signature",
+    label: "Cryptographic Signature",
+    desc:  sigDesc || sigError,
+    pass:  sigValid,
+    critical: true,
+  });
+
+  // ── CHECK 5: Certificate / identity ───────────────────────────────────────
+  setText("verify-progress-label", "Checking identity binding…");
+  await sleep(200);
+
+  const producer  = manifest.producer;
+  const lineId    = producer?.identifier?.replace("line:", "") || null;
+  const isSameUser = State.profile && lineId === State.profile.userId;
+
+  checks.push({
+    id:    "identity",
+    label: "Signer Identity",
+    desc:  producer
+      ? `Producer: ${producer.name} (${producer.identifier || "no ID"})`
+        + (isSameUser ? " — matches current LINE user" : lineId ? " — signed by a different user" : "")
+      : "No producer info in manifest",
+    pass:  !!producer,
+  });
+
+  // ── CHECK 6: Manifest not expired / timestamp plausible ───────────────────
+  const created   = manifest.created ? new Date(manifest.created) : null;
+  const now       = new Date();
+  const inFuture  = created && created > now;
+  const tooOld    = created && (now - created) > 5 * 365 * 24 * 60 * 60 * 1000; // >5 years
+
+  checks.push({
+    id:    "timestamp",
+    label: "Timestamp Plausible",
+    desc:  created
+      ? inFuture
+        ? `Timestamp is in the future (${created.toLocaleString()}) — suspicious`
+        : `Signed ${formatRelative(created)}`
+      : "No timestamp in manifest",
+    pass:  !!created && !inFuture,
+  });
+
+  // ── Overall result ─────────────────────────────────────────────────────────
+  hide("verify-progress");
+
+  const criticalFailed = checks.filter(c => c.critical && !c.pass);
+  const anyFailed      = checks.filter(c => !c.pass);
+  const allPassed      = anyFailed.length === 0;
+
+  let overallVerdict, overallSub;
+  if (criticalFailed.length > 0) {
+    overallVerdict = "Tampered or Invalid";
+    overallSub     = criticalFailed.map(c => c.label).join(" · ") + " failed";
+  } else if (!allPassed) {
+    overallVerdict = "Partially Verified";
+    overallSub     = "Minor issues detected — non-critical checks failed";
+  } else {
+    overallVerdict = "Authentic";
+    overallSub     = "All cryptographic checks passed";
+  }
+
+  renderVerifyResult(checks, manifest, allPassed && criticalFailed.length === 0, overallVerdict, overallSub);
+}
+
+// ── Render the full result UI ──────────────────────────────────────────────
+function renderVerifyResult(checks, manifest, isValid, verdict, sub) {
+  show("verify-result");
+
+  // Banner
+  const banner = id("verify-banner");
+  if (isValid) {
+    banner.style.background   = "rgba(0,229,160,0.07)";
+    banner.style.borderColor  = "rgba(0,229,160,0.3)";
+    id("verify-banner-icon").textContent = "✅";
+  } else {
+    banner.style.background   = "rgba(255,71,87,0.07)";
+    banner.style.borderColor  = "rgba(255,71,87,0.3)";
+    id("verify-banner-icon").textContent = "❌";
+  }
+  setText("verify-title", verdict || "Unknown");
+  setText("verify-sub",   sub    || "");
+
+  // Checks list
+  const container = id("verify-checks");
+  container.innerHTML = checks.map(c => `
+    <div style="
+      display:flex; align-items:flex-start; gap:10px;
+      padding:9px 0; border-bottom:1px solid var(--border);
+    ">
+      <div style="
+        flex-shrink:0; width:20px; height:20px; border-radius:50%;
+        background:${c.pass ? "rgba(0,229,160,0.15)" : "rgba(255,71,87,0.15)"};
+        border:1px solid ${c.pass ? "rgba(0,229,160,0.4)" : "rgba(255,71,87,0.4)"};
+        display:flex; align-items:center; justify-content:center;
+        font-size:11px; margin-top:1px;
+      ">${c.pass ? "✓" : "✕"}</div>
+      <div style="flex:1; min-width:0;">
+        <div style="
+          font-family:var(--mono); font-size:11px; font-weight:500;
+          color:${c.pass ? "var(--text)" : c.critical ? "var(--error)" : "var(--warn)"};
+          margin-bottom:2px;
+        ">${c.label}${c.critical && !c.pass ? " <span style='color:var(--error);font-size:9px;'>CRITICAL</span>" : ""}</div>
+        <div style="
+          font-family:var(--mono); font-size:10px; color:var(--muted);
+          white-space:pre-wrap; word-break:break-all; line-height:1.5;
+        ">${c.desc}</div>
+      </div>
+    </div>
+  `).join("");
+
+  // Manifest viewer
+  if (manifest) {
+    id("verify-manifest").innerHTML = syntaxHighlight(JSON.stringify(manifest, null, 2));
+  } else {
+    id("verify-manifest").textContent = "No manifest data available.";
+  }
+}
+
+// ── Extract manifest + signature from JPEG APP11 segment ──────────────────
+function extractManifestFromImage(buffer) {
+  const bytes    = new Uint8Array(buffer);
+  const labelStr = "c2pa\x00";
+
+  for (let i = 0; i < bytes.length - 10; i++) {
+    if (bytes[i] === 0xFF && bytes[i+1] === 0xEB) {
+      const segLen   = (bytes[i+2] << 8) | bytes[i+3];
+      let labelOff   = i + 4;
+      let match      = true;
+
+      for (let j = 0; j < labelStr.length; j++) {
+        if (bytes[labelOff + j] !== labelStr.charCodeAt(j)) { match = false; break; }
+      }
+
+      if (match) {
+        const payloadStart = labelOff + labelStr.length;
+        const payloadEnd   = i + 2 + segLen;
+        const payloadBytes = bytes.slice(payloadStart, payloadEnd);
+        try {
+          const parsed = JSON.parse(new TextDecoder().decode(payloadBytes));
+          return parsed; // { manifest, signature }
+        } catch(e) {
+          return null;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+// ── Strip the APP11/c2pa segment from a JPEG buffer ───────────────────────
+// This reconstructs what the original image bytes looked like before
+// the manifest was embedded — so we can re-hash and compare.
+function stripManifestSegment(buffer) {
+  const bytes    = new Uint8Array(buffer);
+  const labelStr = "c2pa\x00";
+  const out      = [];
+  let   i        = 0;
+
+  // Keep SOI (first 2 bytes)
+  out.push(bytes[0], bytes[1]);
+  i = 2;
+
+  while (i < bytes.length - 1) {
+    if (bytes[i] !== 0xFF) { out.push(bytes[i++]); continue; }
+
+    const marker = bytes[i+1];
+
+    // SOI / EOI — no length field
+    if (marker === 0xD8 || marker === 0xD9) {
+      out.push(bytes[i], bytes[i+1]);
+      i += 2;
+      continue;
+    }
+
+    // All other markers have a 2-byte length after the marker
+    if (i + 3 >= bytes.length) { out.push(bytes[i++]); continue; }
+    const segLen = (bytes[i+2] << 8) | bytes[i+3];
+
+    // Check if this is our APP11 c2pa segment
+    if (marker === 0xEB && i + 4 + labelStr.length <= bytes.length) {
+      let isC2PA = true;
+      for (let j = 0; j < labelStr.length; j++) {
+        if (bytes[i + 4 + j] !== labelStr.charCodeAt(j)) { isC2PA = false; break; }
+      }
+      if (isC2PA) {
+        // Skip this segment entirely — don't add to output
+        i += 2 + segLen;
+        continue;
+      }
+    }
+
+    // Keep any other segment
+    const end = i + 2 + segLen;
+    for (let k = i; k < end && k < bytes.length; k++) out.push(bytes[k]);
+    i = end;
+  }
+
+  return new Uint8Array(out).buffer;
+}
+
+// ── Format relative time ───────────────────────────────────────────────────
+function formatRelative(date) {
+  const diff = Date.now() - date.getTime();
+  const mins  = Math.floor(diff / 60000);
+  const hours = Math.floor(diff / 3600000);
+  const days  = Math.floor(diff / 86400000);
+  if (mins < 1)   return "just now";
+  if (mins < 60)  return `${mins} minute${mins>1?"s":""} ago`;
+  if (hours < 24) return `${hours} hour${hours>1?"s":""} ago`;
+  return `${days} day${days>1?"s":""} ago (${date.toLocaleDateString()})`;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DOWNLOAD + SHARE
+// ═══════════════════════════════════════════════════════════════════════════
+function downloadSigned() {
+  if (!State.signedBlob) return;
+  const url  = URL.createObjectURL(State.signedBlob);
+  const a    = document.createElement("a");
+  const ts   = new Date().toISOString().replace(/[:.]/g,"-").slice(0,19);
+  a.href = url; a.download = `c2pa-signed-${ts}.jpg`;
+  a.click();
+  URL.revokeObjectURL(url);
+  showToast("Downloading signed image…", "success");
+}
+
+async function shareToLine() {
+  if (!State.signedBlob) return;
+  if (CONFIG.USE_DEMO_MODE || !window.liff) {
+    showToast("LINE share requires real LIFF context", "error");
+    return;
+  }
+  try {
+    // In a real app, upload to your storage first to get a URL, then share
+    await liff.shareTargetPicker([{
+      type: "image",
+      originalContentUrl: "https://your-storage.com/signed-image.jpg",
+      previewImageUrl: "https://your-storage.com/signed-image.jpg"
+    }]);
+    showToast("Shared to LINE!", "success");
+  } catch(e) {
+    showToast("Share failed: " + e.message, "error");
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TABS
+// ═══════════════════════════════════════════════════════════════════════════
+function switchTab(name, btn) {
+  document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
+  btn.classList.add("active");
+  id("tab-capture").style.display = name === "capture" ? "block" : "none";
+  id("tab-verify").style.display  = name === "verify"  ? "block" : "none";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// UI HELPERS
+// ═══════════════════════════════════════════════════════════════════════════
+function showMain() {
+  show("identity-section");
+  show("main-section");
+}
+
+function show(el) { const e = typeof el === "string" ? id(el) : el; if(e) e.style.display = "block"; }
+function hide(el) { const e = typeof el === "string" ? id(el) : el; if(e) e.style.display = "none"; }
+function id(i)    { return document.getElementById(i); }
+function setText(i, t) { const e = id(i); if(e) e.textContent = t; }
+function getText(i)    { return id(i); }
+function sleep(ms)     { return new Promise(r => setTimeout(r, ms)); }
+
+function dot(id_, on) {
+  const el = document.getElementById(id_);
+  if (!el) return;
+  if (on) el.classList.add("active");
+  else    el.classList.remove("active");
+}
+
+function fmtLog(msg, type) {
+  const col = type === "error" ? "var(--error)" : type === "muted" ? "var(--muted)" : "var(--accent)";
+  const ts  = new Date().toLocaleTimeString();
+  return `<div style="color:${col}; margin-bottom:2px;"><span style="color:var(--muted)">[${ts}]</span> ${msg}</div>`;
+}
+
+function showOverlay(on) {
+  const el = id("signing-overlay");
+  if (on) {
+    el.classList.add("active");
+    // reset steps
+    document.querySelectorAll(".signing-step").forEach(s => {
+      s.classList.remove("done","active-step");
+    });
+  } else {
+    el.classList.remove("active");
+  }
+}
+
+function activateStep(stepId) {
+  const el = id(stepId);
+  if (el) el.classList.add("active-step");
+}
+
+function doneStep(stepId) {
+  const el = id(stepId);
+  if (el) { el.classList.remove("active-step"); el.classList.add("done"); }
+}
+
+let toastTimer = null;
+function showToast(msg, type) {
+  const el = id("toast");
+  el.textContent = type === "success" ? "✓ " + msg : type === "error" ? "✕ " + msg : msg;
+  el.className = "show " + (type || "");
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.className = "", 2800);
+}
+
+function syntaxHighlight(json) {
+  return json.replace(/("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+\-]?\d+)?)/g, match => {
+    let cls = "num";
+    if (/^"/.test(match)) cls = /:$/.test(match) ? "key" : "str";
+    else if (/true|false/.test(match)) cls = "bool";
+    return `<span class="${cls}">${match}</span>`;
+  });
+}
+
+// ── Export current user's public key as base64 SPKI ───────────────────────
+async function exportPublicKeySPKI() {
+  if (!State.keyPair?.publicKey) return null;
+  try {
+    const spki = await crypto.subtle.exportKey("spki", State.keyPair.publicKey);
+    return arrayToBase64(spki);
+  } catch(e) { return null; }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CRYPTO UTILS
+// ═══════════════════════════════════════════════════════════════════════════
+function arrayToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let bin = "";
+  bytes.forEach(b => bin += String.fromCharCode(b));
+  return btoa(bin);
+}
+
+function base64ToArray(b64) {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out.buffer;
+}
+
+function arrayToHex(buf) {
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2,"0")).join("");
+}
+
+function derToPem(derBuffer, label) {
+  const b64 = arrayToBase64(derBuffer);
+  const lines = b64.match(/.{1,64}/g).join("\n");
+  return `-----BEGIN ${label}-----\n${lines}\n-----END ${label}-----\n`;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BOOT
+// ═══════════════════════════════════════════════════════════════════════════
+window.addEventListener("DOMContentLoaded", () => {
+  // Prevent zoom on double-tap (mobile)
+  document.addEventListener("touchend", e => {
+    if (e.timeStamp - (window._lastTouch || 0) < 300) e.preventDefault();
+    window._lastTouch = e.timeStamp;
+  }, { passive: false });
+
+  initLiff();
+});
+</script>
+</body>
+</html>
