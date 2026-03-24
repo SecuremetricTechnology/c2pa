@@ -625,7 +625,7 @@
   <div class="header">
     <div class="logo">
       <div class="logo-icon">🔏</div>
-      <div class="logo-text">C2PA<span>Sign</span></div>
+      <div class="logo-text">C2PA<span>Sign</span><p id="version"></p></div>
     </div>
     <div class="header-status">
       <div><span class="status-dot" id="liff-dot"></span><span id="liff-status-txt">Connecting…</span></div>
@@ -871,6 +871,7 @@ const CONFIG = {
   // For demo/dev: set USE_DEMO_MODE=true to bypass real LIFF+CA
   USE_DEMO_MODE:  false
 };
+  document.getElementById("version").textContent = CONFIG.APP_VERSION;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // STATE
