@@ -869,7 +869,7 @@ const CONFIG = {
   APP_VERSION:    "1.0.0",
   CLAIM_GENERATOR:"LINE-C2PA-App/1.0 c2pa/1.4",
   // For demo/dev: set USE_DEMO_MODE=true to bypass real LIFF+CA
-  USE_DEMO_MODE:  true
+  USE_DEMO_MODE:  false
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1079,9 +1079,8 @@ async function buildSimpleCSR(keyPair, userId) {
 // In production: POST csr to CONFIG.CA_ENDPOINT
 // ═══════════════════════════════════════════════════════════════════════════
 async function issueCertificate(csrB64, pubKeyDer, keyPair) {
-  if (CONFIG.USE_DEMO_MODE) {
-    return await selfSignCert(keyPair, State.profile);
-  }
+  return await selfSignCert(keyPair, State.profile);
+  /*
   // Production: POST to your CA backend
   const res = await fetch(CONFIG.CA_ENDPOINT + "/issue-cert", {
     method: "POST",
@@ -1097,6 +1096,7 @@ async function issueCertificate(csrB64, pubKeyDer, keyPair) {
   if (!res.ok) throw new Error("CA returned " + res.status);
   const { certificate } = await res.json();
   return base64ToArray(certificate);
+  */
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
