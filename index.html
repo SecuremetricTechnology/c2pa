@@ -625,11 +625,12 @@
   <div class="header">
     <div class="logo">
       <div class="logo-icon">🔏</div>
-      <div class="logo-text">C2PA<span>Sign</span><p id="version"></p></div>
+      <div class="logo-text">C2PA<span>Sign</span></div>
     </div>
     <div class="header-status">
       <div><span class="status-dot" id="liff-dot"></span><span id="liff-status-txt">Connecting…</span></div>
       <div><span class="status-dot" id="key-dot"></span><span id="key-status-txt">No keypair</span></div>
+	  <div><span class="status-dot" id="ver-dot"></span><span id="ver-status-txt"></span></div>
     </div>
   </div>
 
@@ -834,7 +835,6 @@
       <div class="manifest-viewer" id="result-manifest"></div>
       <div style="margin-top:10px;" class="row-btns">
         <button class="btn-primary" onclick="downloadSigned()">⬇ Download</button>
-        <button class="btn-secondary" onclick="shareToLine()">↗ Share to LINE</button>
       </div>
       <button class="btn-icon" style="width:100%; margin-top:8px; justify-content:center;" onclick="resetCapture()">↩ Capture Another</button>
     </div>
@@ -866,12 +866,11 @@ const CONFIG = {
   LIFF_ID:        "2009585738-WxMZ4Cfw",          // replace before deploying
   CA_ENDPOINT:    "https://your-ca-backend.com", // your CA backend
   STORAGE_BUCKET: "https://your-storage.com",    // signed asset storage
-  APP_VERSION:    "0.1.0",
+  APP_VERSION:    "0.2.0",
   CLAIM_GENERATOR:"LINE-C2PA-App/1.0 c2pa/1.4",
   // For demo/dev: set USE_DEMO_MODE=true to bypass real LIFF+CA
   USE_DEMO_MODE:  false
 };
-  document.getElementById("version").textContent = CONFIG.APP_VERSION;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // STATE
@@ -1893,12 +1892,21 @@ function formatRelative(date) {
 function downloadSigned() {
   if (!State.signedBlob) return;
   const url  = URL.createObjectURL(State.signedBlob);
+  
+  // Open in new tab
+  window.open(url, "_blank");
+  
+  //below code might not work in iOS
+  /*
   const a    = document.createElement("a");
   const ts   = new Date().toISOString().replace(/[:.]/g,"-").slice(0,19);
   a.href = url; a.download = `c2pa-signed-${ts}.jpg`;
   a.click();
   URL.revokeObjectURL(url);
+  */
+  
   showToast("Downloading signed image…", "success");
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
 }
 
 async function shareToLine() {
@@ -2047,6 +2055,10 @@ window.addEventListener("DOMContentLoaded", () => {
 
   initLiff();
 });
+
+//add apps version into display
+setText ("ver-status-txt",CONFIG.APP_VERSION);
+
 </script>
 </body>
 </html>
