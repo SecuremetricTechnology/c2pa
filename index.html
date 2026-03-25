@@ -775,7 +775,10 @@
         <div class="card-body">
           <div class="manifest-field">
             <label class="manifest-label">LOAD A SIGNED IMAGE</label>
-            <input type="file" accept="image/*" class="manifest-input" id="verify-file" onchange="loadVerifyFile(event)" style="padding:7px 10px; cursor:pointer;">
+            <input type="file" accept="image/*,.c2pa,application/json" class="manifest-input" id="verify-file" onchange="loadVerifyFile(event)" style="padding:7px 10px; cursor:pointer;">
+            <div style="font-family:var(--mono);font-size:10px;color:var(--muted);margin-top:6px;line-height:1.7;">
+              Accepts: signed <strong style="color:var(--text);">.jpg</strong> (Save to Files) or <strong style="color:var(--text);">.c2pa</strong> sidecar (for Photos-saved images)
+            </div>
           </div>
 
           <!-- Verification in progress -->
@@ -833,8 +836,12 @@
       </div>
       <img id="result-img" style="width:100%; border-radius:8px; margin-bottom:14px;" alt="Signed">
       <div class="manifest-viewer" id="result-manifest"></div>
-      <div style="margin-top:10px;" class="row-btns">
-        <button class="btn-primary" onclick="downloadSigned()">⬇ Download</button>
+      <div style="margin-top:12px; background:rgba(0,153,255,0.07); border:1px solid rgba(0,153,255,0.2); border-radius:10px; padding:10px 14px; font-family:var(--mono); font-size:10px; color:var(--accent2); line-height:1.7;" id="ios-save-hint" style="display:none;">
+        💡 <strong>iOS users:</strong> Tap <em>"Save Signed Image"</em> — choose <strong>Save to Files</strong> to preserve the C2PA manifest. Saving to Photos re-encodes the image and strips the manifest. Use the <strong>.c2pa sidecar</strong> file to verify images saved to Photos.
+      </div>
+      <div style="margin-top:10px; display:flex; flex-direction:column; gap:8px;">
+        <button class="btn-primary" onclick="downloadSigned()">⬇ Save Signed Image (.jpg)</button>
+        <button class="btn-icon" style="width:100%; justify-content:center;" onclick="downloadSidecar()">📄 Save Manifest Sidecar (.c2pa)</button>
       </div>
       <button class="btn-icon" style="width:100%; margin-top:8px; justify-content:center;" onclick="resetCapture()">↩ Capture Another</button>
     </div>
@@ -866,7 +873,7 @@ const CONFIG = {
   LIFF_ID:        "2009585738-WxMZ4Cfw",          // replace before deploying
   CA_ENDPOINT:    "https://your-ca-backend.com", // your CA backend
   STORAGE_BUCKET: "https://your-storage.com",    // signed asset storage
-  APP_VERSION:    "0.3.0",
+  APP_VERSION:    "0.3.alpha",
   CLAIM_GENERATOR:"LINE-C2PA-App/1.0 c2pa/1.4",
   // For demo/dev: set USE_DEMO_MODE=true to bypass real LIFF+CA
   USE_DEMO_MODE:  false
@@ -1403,6 +1410,8 @@ async function signCapture() {
     await sleep(300);
 
     showOverlay(false);
+    State.signedManifest = manifest;
+    State.signedSig      = signatureB64;
     showResult(manifest, signatureB64);
 
   } catch(e) {
@@ -1474,20 +1483,56 @@ async function buildManifest(imgHashB64) {
 
 // Embed manifest into JPEG by appending a custom JUMBF-like APP11 segment
 async function embedManifestInImage(imgBuffer, manifest, signatureB64) {
-  const payload = JSON.stringify({ manifest, signature: signatureB64, version: "1.0" });
+  const payload     = JSON.stringify({ manifest, signature: signatureB64, version: "1.0" });
   const payloadBytes = new TextEncoder().encode(payload);
 
-  // Build a JPEG APP11 segment (marker 0xFFEB) to hold our C2PA data
-  // Real C2PA uses JUMBF boxes inside APP11; this is a simplified container
-  const marker      = new Uint8Array([0xFF, 0xEB]);
-  const label       = new TextEncoder().encode("c2pa\x00");
-  const dataLen     = label.length + payloadBytes.length + 2; // +2 for length field
-  const lenBytes    = new Uint8Array([(dataLen >> 8) & 0xff, dataLen & 0xff]);
-  const segment     = concatBytes(marker, lenBytes, label, payloadBytes);
+  // ── Segment 1: APP11 (0xFFEB) — full C2PA payload ─────────────────────────
+  // Survives "Save to Files" on iOS. Stripped by Photos re-encode.
+  const app11Marker  = new Uint8Array([0xFF, 0xEB]);
+  const app11Label   = new TextEncoder().encode("c2pa\x00");
+  const app11DataLen = app11Label.length + payloadBytes.length + 2;
+  const app11Len     = new Uint8Array([(app11DataLen >> 8) & 0xff, app11DataLen & 0xff]);
+  const app11Seg     = concatBytes(app11Marker, app11Len, app11Label, payloadBytes);
 
-  // Find SOI (0xFFD8) + insert after it
-  const orig = new Uint8Array(imgBuffer);
-  const result = concatBytes(orig.slice(0, 2), segment, orig.slice(2));
+  // ── Segment 2: APP1 XMP (0xFFE1) — compact fingerprint ────────────────────
+  // iOS Photos DOES preserve standard XMP (APP1 with Adobe XMP namespace).
+  // We embed a fingerprint: signer ID + image hash + signature prefix.
+  // This alone cannot be used to fully verify, but proves the image was
+  // signed and links it to the sidecar .c2pa file for full verification.
+  const hashAssertion = manifest.assertions?.find(a => a.label === "c2pa.hash.data");
+  const imgHash       = hashAssertion?.data?.hash || "";
+  const sigPrefix     = signatureB64.substring(0, 32);
+  const xmpXml = [
+    "<?xpacket begin='\uFEFF' id='W5M0MpCehiHzreSzNTczkc9d'?>",
+    "<x:xmpmeta xmlns:x='adobe:ns:meta/'>",
+    "  <rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>",
+    "    <rdf:Description rdf:about=''",
+    "      xmlns:c2pa='https://c2pa.org/assertions'",
+    "      xmlns:dc='http://purl.org/dc/elements/1.1/'",
+    "      xmlns:xmp='http://ns.adobe.com/xap/1.0/'>",
+    `      <c2pa:signer>${manifest.producer?.identifier || ""}</c2pa:signer>`,
+    `      <c2pa:created>${manifest.created || ""}</c2pa:created>`,
+    `      <c2pa:hash>${imgHash}</c2pa:hash>`,
+    `      <c2pa:sig_prefix>${sigPrefix}</c2pa:sig_prefix>`,
+    `      <c2pa:claim_generator>${manifest.claim_generator || ""}</c2pa:claim_generator>`,
+    `      <dc:title>${manifest["dc:title"] || ""}</dc:title>`,
+    "    </rdf:Description>",
+    "  </rdf:RDF>",
+    "</x:xmpmeta>",
+    "<?xpacket end='w'?>"
+  ].join("\n");
+
+  const xmpNs       = new TextEncoder().encode("http://ns.adobe.com/xap/1.0/\x00");
+  const xmpData     = new TextEncoder().encode(xmpXml);
+  const app1Body    = concatBytes(xmpNs, xmpData);
+  const app1BodyLen = app1Body.length + 2; // +2 for length field itself
+  const app1Marker  = new Uint8Array([0xFF, 0xE1]);
+  const app1Len     = new Uint8Array([(app1BodyLen >> 8) & 0xff, app1BodyLen & 0xff]);
+  const app1Seg     = concatBytes(app1Marker, app1Len, app1Body);
+
+  // ── Assemble: SOI + XMP(APP1) + C2PA(APP11) + rest of image ──────────────
+  const orig   = new Uint8Array(imgBuffer);
+  const result = concatBytes(orig.slice(0, 2), app1Seg, app11Seg, orig.slice(2));
 
   return new Blob([result], { type: "image/jpeg" });
 }
@@ -1512,12 +1557,15 @@ function showResult(manifest, signatureB64) {
     "cose_signature": signatureB64.substring(0, 32) + "…",
   }, null, 2));
 
+  maybeShowIOSHint();
   showToast("Image signed successfully!", "success");
 }
 
 function resetCapture() {
-  State.capturedBlob = null;
-  State.signedBlob   = null;
+  State.capturedBlob   = null;
+  State.signedBlob     = null;
+  State.signedManifest = null;
+  State.signedSig      = null;
   hide("result-section");
   hide("preview-section");
   hide("manifest-form");
@@ -1536,6 +1584,29 @@ async function loadVerifyFile(event) {
   hide("verify-result");
   show("verify-progress");
   setText("verify-progress-label", "Extracting manifest…");
+
+  // ── Sidecar .c2pa file path ───────────────────────────────────────────────
+  if (file.name.endsWith(".c2pa") || file.type === "application/json") {
+    setText("verify-progress-label", "Reading sidecar manifest…");
+    await sleep(200);
+    try {
+      const text    = await file.text();
+      const sidecar = JSON.parse(text);
+      if (!sidecar.manifest || !sidecar.signature) throw new Error("Invalid sidecar format");
+
+      hide("verify-progress");
+      // For sidecar we cannot re-hash the image (we don't have it),
+      // so we verify only the signature and manifest structure.
+      await verifySidecar(sidecar.manifest, sidecar.signature);
+    } catch(e) {
+      hide("verify-progress");
+      renderVerifyResult([{
+        id: "parse", label: "Sidecar Parse", pass: false,
+        desc: "Could not parse .c2pa file: " + e.message, critical: true
+      }], null, false, "Invalid Sidecar", e.message);
+    }
+    return;
+  }
 
   const buffer = await file.arrayBuffer();
   await sleep(300);
@@ -1739,6 +1810,103 @@ async function loadVerifyFile(event) {
 }
 
 // ── Render the full result UI ──────────────────────────────────────────────
+// ── Verify a .c2pa sidecar (no image available — skips hash check) ────────────
+async function verifySidecar(manifest, signatureB64) {
+  const checks = [];
+
+  // Structure check
+  const hasRequiredFields = !!(manifest.claim_generator && manifest.created &&
+    manifest.producer && Array.isArray(manifest.assertions));
+  checks.push({
+    id: "manifest_structure", label: "Manifest Structure Valid",
+    desc: hasRequiredFields ? "Required fields present ✓" : "Missing required manifest fields",
+    pass: hasRequiredFields,
+  });
+
+  // Hash check — skipped (no image)
+  checks.push({
+    id: "image_hash", label: "Image Hash Integrity",
+    desc: "⚠ Skipped — sidecar verification does not include the original image.
+Load the original signed .jpg to verify pixel integrity.",
+    pass: true, // not a failure — just not possible without the image
+  });
+
+  // Signature check
+  let sigValid = false, sigDesc = "";
+  if (!signatureB64) {
+    sigDesc = "No signature in sidecar";
+  } else {
+    const manifestBytes = new TextEncoder().encode(JSON.stringify(manifest));
+    const sigBytes      = base64ToArray(signatureB64);
+
+    // Try current user key
+    if (State.keyPair?.publicKey) {
+      try {
+        sigValid = await crypto.subtle.verify(
+          { name: "ECDSA", hash: { name: "SHA-256" } },
+          State.keyPair.publicKey, sigBytes, manifestBytes
+        );
+        sigDesc = sigValid
+          ? "ECDSA P-256 valid — signed by this device"
+          : "Invalid for this device key";
+      } catch(e) { sigDesc = "Verification error: " + e.message; }
+    }
+
+    // Try embedded public key
+    if (!sigValid && manifest.signature_info?.public_key_spki) {
+      try {
+        const spki   = base64ToArray(manifest.signature_info.public_key_spki);
+        const pubKey = await crypto.subtle.importKey(
+          "spki", spki, { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]
+        );
+        sigValid = await crypto.subtle.verify(
+          { name: "ECDSA", hash: { name: "SHA-256" } },
+          pubKey, sigBytes, manifestBytes
+        );
+        sigDesc = sigValid
+          ? "ECDSA P-256 valid — verified against embedded public key"
+          : "Signature does not match embedded public key";
+      } catch(e) { sigDesc = "Key import error: " + e.message; }
+    }
+
+    if (!sigDesc) sigDesc = "Public key not available for verification";
+  }
+  checks.push({
+    id: "signature", label: "Cryptographic Signature",
+    desc: sigDesc, pass: sigValid, critical: true,
+  });
+
+  // Identity
+  const producer = manifest.producer;
+  checks.push({
+    id: "identity", label: "Signer Identity",
+    desc: producer
+      ? `Producer: ${producer.name} (${producer.identifier || "no ID"})`
+      : "No producer info",
+    pass: !!producer,
+  });
+
+  // Timestamp
+  const created  = manifest.created ? new Date(manifest.created) : null;
+  const inFuture = created && created > new Date();
+  checks.push({
+    id: "timestamp", label: "Timestamp Plausible",
+    desc: created ? (inFuture ? `Future timestamp: ${created.toLocaleString()}` : `Signed ${formatRelative(created)}`) : "No timestamp",
+    pass: !!created && !inFuture,
+  });
+
+  const critFailed = checks.filter(c => c.critical && !c.pass);
+  const allPassed  = checks.filter(c => !c.pass).length === 0;
+  hide("verify-progress");
+  renderVerifyResult(
+    checks, manifest,
+    allPassed && critFailed.length === 0,
+    critFailed.length > 0 ? "Invalid Sidecar" : allPassed ? "Sidecar Authentic" : "Partially Verified",
+    critFailed.length > 0 ? critFailed.map(c => c.label).join(" · ") + " failed"
+      : "Note: pixel integrity not checked — load the original .jpg for full verification"
+  );
+}
+
 function renderVerifyResult(checks, manifest, isValid, verdict, sub) {
   show("verify-result");
 
@@ -1887,11 +2055,20 @@ function formatRelative(date) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// DOWNLOAD + SHARE
+// DOWNLOAD + SIDECAR
 // ═══════════════════════════════════════════════════════════════════════════
+
 function isIOS() {
   return /iPad|iPhone|iPod/.test(navigator.userAgent) ||
     (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+}
+
+// Show the iOS info banner in result section
+function maybeShowIOSHint() {
+  if (isIOS()) {
+    const hint = id("ios-save-hint");
+    if (hint) hint.style.display = "block";
+  }
 }
 
 async function downloadSigned() {
@@ -1900,32 +2077,29 @@ async function downloadSigned() {
   const fileName = `c2pa-signed-${ts}.jpg`;
 
   if (isIOS()) {
-    // LINE WebView on iOS blocks both a.click() blob downloads AND window.open().
-    // The only reliable escape hatch is the native Web Share API — it invokes
-    // the OS-level share sheet directly, bypassing all WebView restrictions.
-
-    // Strategy 1: Web Share API with file (iOS 15+, works inside LINE WebView)
+    // iOS: Web Share API invokes the native OS share sheet,
+    // bypassing LINE WebView popup restrictions entirely.
+    // IMPORTANT: Tell the user to choose "Save to Files" not "Save Image"
+    // because "Save Image" triggers Photos re-encode which strips APP11.
     if (navigator.share && navigator.canShare) {
       const file = new File([State.signedBlob], fileName, { type: "image/jpeg" });
       if (navigator.canShare({ files: [file] })) {
         try {
           await navigator.share({ files: [file], title: "C2PA Signed Image" });
-          showToast("Saved!", "success");
+          showToast("Use Save to Files to keep C2PA manifest", "success");
           return;
         } catch (e) {
-          if (e.name === "AbortError") return; // user cancelled — not an error
-          // fall through to Strategy 2
+          if (e.name === "AbortError") return;
+          // fall through to modal
         }
       }
     }
-
-    // Strategy 2: inline save modal — always works, no new window needed.
-    // User long-presses the image -> iOS context menu -> "Add to Photos" / "Save to Files".
+    // Fallback: inline modal — user long-presses to save
     const url = URL.createObjectURL(State.signedBlob);
     showIOSSaveModal(url, fileName);
 
   } else {
-    // Android / desktop — standard anchor click works fine
+    // Android / desktop
     const url = URL.createObjectURL(State.signedBlob);
     const a   = document.createElement("a");
     a.href     = url;
@@ -1934,8 +2108,52 @@ async function downloadSigned() {
     a.click();
     document.body.removeChild(a);
     setTimeout(() => URL.revokeObjectURL(url), 5000);
-    showToast("Downloading...", "success");
+    showToast("Downloading…", "success");
   }
+}
+
+// Download the manifest + signature as a .c2pa sidecar JSON file.
+// This is the verification source for images that went through Photos re-encode.
+async function downloadSidecar() {
+  if (!State.signedManifest || !State.signedSig) {
+    showToast("No signed manifest in memory", "error");
+    return;
+  }
+  const ts       = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const fileName = `c2pa-sidecar-${ts}.c2pa`;
+  const sidecar  = JSON.stringify({
+    version:   "1.0",
+    format:    "c2pa-sidecar",
+    manifest:  State.signedManifest,
+    signature: State.signedSig,
+    note:      "Use this file to verify the corresponding signed JPEG via the C2PA verify tab."
+  }, null, 2);
+
+  const blob = new Blob([sidecar], { type: "application/json" });
+
+  if (isIOS() && navigator.share && navigator.canShare) {
+    const file = new File([blob], fileName, { type: "application/json" });
+    if (navigator.canShare({ files: [file] })) {
+      try {
+        await navigator.share({ files: [file], title: "C2PA Manifest Sidecar" });
+        showToast("Sidecar saved!", "success");
+        return;
+      } catch(e) {
+        if (e.name === "AbortError") return;
+      }
+    }
+  }
+
+  // Fallback: anchor download
+  const url = URL.createObjectURL(blob);
+  const a   = document.createElement("a");
+  a.href     = url;
+  a.download = fileName;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+  showToast("Sidecar downloaded!", "success");
 }
 
 function showIOSSaveModal(blobUrl, fileName) {
@@ -1957,14 +2175,14 @@ function showIOSSaveModal(blobUrl, fileName) {
   title.style.cssText = "font-family:var(--sans);font-weight:800;font-size:17px;color:var(--text);";
   title.textContent = "Save Signed Image";
 
-  const instructions = document.createElement("div");
-  instructions.style.cssText = "font-family:var(--mono);font-size:12px;color:var(--muted);text-align:center;line-height:1.9;";
-  instructions.innerHTML = "Long-press the image below, then tap<br><span style=\"color:var(--accent);font-weight:600;\">\"Add to Photos\"</span>&nbsp;or&nbsp;<span style=\"color:var(--accent);font-weight:600;\">\"Save to Files\"</span>";
+  const warn = document.createElement("div");
+  warn.style.cssText = "font-family:var(--mono);font-size:11px;background:rgba(0,153,255,0.1);border:1px solid rgba(0,153,255,0.25);border-radius:8px;padding:10px 12px;color:var(--accent2);line-height:1.7;text-align:center;";
+  warn.innerHTML = "Long-press the image, then tap<br><strong>"Save to Files"</strong> (not "Save Image")<br>to preserve the C2PA manifest.";
 
   const img = document.createElement("img");
   img.src = blobUrl;
   img.alt = "Long-press to save";
-  img.style.cssText = "max-width:100%;max-height:52vh;border-radius:12px;border:1px solid var(--border);object-fit:contain;";
+  img.style.cssText = "max-width:100%;max-height:45vh;border-radius:12px;border:1px solid var(--border);object-fit:contain;";
 
   const fileLabel = document.createElement("div");
   fileLabel.style.cssText = "font-family:var(--mono);font-size:10px;color:var(--muted);";
@@ -1976,30 +2194,11 @@ function showIOSSaveModal(blobUrl, fileName) {
   closeBtn.onclick = () => modal.remove();
 
   modal.appendChild(title);
-  modal.appendChild(instructions);
+  modal.appendChild(warn);
   modal.appendChild(img);
   modal.appendChild(fileLabel);
   modal.appendChild(closeBtn);
   document.body.appendChild(modal);
-}
-
-async function shareToLine() {
-  if (!State.signedBlob) return;
-  if (CONFIG.USE_DEMO_MODE || !window.liff) {
-    showToast("LINE share requires real LIFF context", "error");
-    return;
-  }
-  try {
-    // In a real app, upload to your storage first to get a URL, then share
-    await liff.shareTargetPicker([{
-      type: "image",
-      originalContentUrl: "https://your-storage.com/signed-image.jpg",
-      previewImageUrl: "https://your-storage.com/signed-image.jpg"
-    }]);
-    showToast("Shared to LINE!", "success");
-  } catch(e) {
-    showToast("Share failed: " + e.message, "error");
-  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
