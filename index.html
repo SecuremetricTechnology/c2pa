@@ -866,7 +866,7 @@ const CONFIG = {
   LIFF_ID:        "2009585738-WxMZ4Cfw",          // replace before deploying
   CA_ENDPOINT:    "https://your-ca-backend.com", // your CA backend
   STORAGE_BUCKET: "https://your-storage.com",    // signed asset storage
-  APP_VERSION:    "0.2.0",
+  APP_VERSION:    "0.3.0",
   CLAIM_GENERATOR:"LINE-C2PA-App/1.0 c2pa/1.4",
   // For demo/dev: set USE_DEMO_MODE=true to bypass real LIFF+CA
   USE_DEMO_MODE:  false
@@ -1889,24 +1889,98 @@ function formatRelative(date) {
 // ═══════════════════════════════════════════════════════════════════════════
 // DOWNLOAD + SHARE
 // ═══════════════════════════════════════════════════════════════════════════
-function downloadSigned() {
+function isIOS() {
+  return /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+    (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+}
+
+async function downloadSigned() {
   if (!State.signedBlob) return;
-  const url  = URL.createObjectURL(State.signedBlob);
-  
-  // Open in new tab
-  window.open(url, "_blank");
-  
-  //below code might not work in iOS
-  /*
-  const a    = document.createElement("a");
-  const ts   = new Date().toISOString().replace(/[:.]/g,"-").slice(0,19);
-  a.href = url; a.download = `c2pa-signed-${ts}.jpg`;
-  a.click();
-  URL.revokeObjectURL(url);
-  */
-  
-  showToast("Downloading signed image…", "success");
-  setTimeout(() => URL.revokeObjectURL(url), 5000);
+  const ts       = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const fileName = `c2pa-signed-${ts}.jpg`;
+
+  if (isIOS()) {
+    // LINE WebView on iOS blocks both a.click() blob downloads AND window.open().
+    // The only reliable escape hatch is the native Web Share API — it invokes
+    // the OS-level share sheet directly, bypassing all WebView restrictions.
+
+    // Strategy 1: Web Share API with file (iOS 15+, works inside LINE WebView)
+    if (navigator.share && navigator.canShare) {
+      const file = new File([State.signedBlob], fileName, { type: "image/jpeg" });
+      if (navigator.canShare({ files: [file] })) {
+        try {
+          await navigator.share({ files: [file], title: "C2PA Signed Image" });
+          showToast("Saved!", "success");
+          return;
+        } catch (e) {
+          if (e.name === "AbortError") return; // user cancelled — not an error
+          // fall through to Strategy 2
+        }
+      }
+    }
+
+    // Strategy 2: inline save modal — always works, no new window needed.
+    // User long-presses the image -> iOS context menu -> "Add to Photos" / "Save to Files".
+    const url = URL.createObjectURL(State.signedBlob);
+    showIOSSaveModal(url, fileName);
+
+  } else {
+    // Android / desktop — standard anchor click works fine
+    const url = URL.createObjectURL(State.signedBlob);
+    const a   = document.createElement("a");
+    a.href     = url;
+    a.download = fileName;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+    showToast("Downloading...", "success");
+  }
+}
+
+function showIOSSaveModal(blobUrl, fileName) {
+  const existing = document.getElementById("ios-save-modal");
+  if (existing) existing.remove();
+
+  const modal = document.createElement("div");
+  modal.id = "ios-save-modal";
+  modal.style.cssText = [
+    "position:fixed; inset:0; z-index:300;",
+    "background:rgba(10,12,16,0.97);",
+    "display:flex; flex-direction:column;",
+    "align-items:center; justify-content:center;",
+    "gap:16px; padding:24px;",
+    "backdrop-filter:blur(10px);"
+  ].join("");
+
+  const title = document.createElement("div");
+  title.style.cssText = "font-family:var(--sans);font-weight:800;font-size:17px;color:var(--text);";
+  title.textContent = "Save Signed Image";
+
+  const instructions = document.createElement("div");
+  instructions.style.cssText = "font-family:var(--mono);font-size:12px;color:var(--muted);text-align:center;line-height:1.9;";
+  instructions.innerHTML = "Long-press the image below, then tap<br><span style=\"color:var(--accent);font-weight:600;\">\"Add to Photos\"</span>&nbsp;or&nbsp;<span style=\"color:var(--accent);font-weight:600;\">\"Save to Files\"</span>";
+
+  const img = document.createElement("img");
+  img.src = blobUrl;
+  img.alt = "Long-press to save";
+  img.style.cssText = "max-width:100%;max-height:52vh;border-radius:12px;border:1px solid var(--border);object-fit:contain;";
+
+  const fileLabel = document.createElement("div");
+  fileLabel.style.cssText = "font-family:var(--mono);font-size:10px;color:var(--muted);";
+  fileLabel.textContent = fileName;
+
+  const closeBtn = document.createElement("button");
+  closeBtn.style.cssText = "padding:12px 36px;border-radius:10px;border:1px solid var(--border);background:transparent;color:var(--text);font-family:var(--sans);font-weight:600;font-size:14px;cursor:pointer;";
+  closeBtn.textContent = "Done";
+  closeBtn.onclick = () => modal.remove();
+
+  modal.appendChild(title);
+  modal.appendChild(instructions);
+  modal.appendChild(img);
+  modal.appendChild(fileLabel);
+  modal.appendChild(closeBtn);
+  document.body.appendChild(modal);
 }
 
 async function shareToLine() {
