@@ -873,7 +873,7 @@ const CONFIG = {
   LIFF_ID:        "2009585738-WxMZ4Cfw",          // replace before deploying
   CA_ENDPOINT:    "https://your-ca-backend.com", // your CA backend
   STORAGE_BUCKET: "https://your-storage.com",    // signed asset storage
-  APP_VERSION:    "0.3.alpha",
+  APP_VERSION:    "0.4.alpha",
   CLAIM_GENERATOR:"LINE-C2PA-App/1.0 c2pa/1.4",
   // For demo/dev: set USE_DEMO_MODE=true to bypass real LIFF+CA
   USE_DEMO_MODE:  false
@@ -1990,14 +1990,16 @@ function extractManifestFromImage(buffer) {
   return null;
 }
 
-// ── Strip the APP11/c2pa segment from a JPEG buffer ───────────────────────
-// This reconstructs what the original image bytes looked like before
-// the manifest was embedded — so we can re-hash and compare.
+// ── Strip all C2PA-injected segments from a JPEG buffer ──────────────────
+// Removes both our APP11 (c2pa label) and our APP1 XMP segment so the
+// re-hashed bytes exactly match what was hashed at signing time
+// (which was the original camera JPEG before any embedding).
 function stripManifestSegment(buffer) {
-  const bytes    = new Uint8Array(buffer);
-  const labelStr = "c2pa\x00";
-  const out      = [];
-  let   i        = 0;
+  const bytes      = new Uint8Array(buffer);
+  const c2paLabel  = "c2pa\x00";
+  const xmpNsLabel = "http://ns.adobe.com/xap/1.0/\x00";
+  const out        = [];
+  let   i          = 0;
 
   // Keep SOI (first 2 bytes)
   out.push(bytes[0], bytes[1]);
@@ -2015,24 +2017,28 @@ function stripManifestSegment(buffer) {
       continue;
     }
 
-    // All other markers have a 2-byte length after the marker
     if (i + 3 >= bytes.length) { out.push(bytes[i++]); continue; }
     const segLen = (bytes[i+2] << 8) | bytes[i+3];
 
-    // Check if this is our APP11 c2pa segment
-    if (marker === 0xEB && i + 4 + labelStr.length <= bytes.length) {
-      let isC2PA = true;
-      for (let j = 0; j < labelStr.length; j++) {
-        if (bytes[i + 4 + j] !== labelStr.charCodeAt(j)) { isC2PA = false; break; }
+    // Check if this is our APP11 c2pa segment (0xFFEB + "c2pa " label)
+    if (marker === 0xEB && i + 4 + c2paLabel.length <= bytes.length) {
+      let match = true;
+      for (let j = 0; j < c2paLabel.length; j++) {
+        if (bytes[i + 4 + j] !== c2paLabel.charCodeAt(j)) { match = false; break; }
       }
-      if (isC2PA) {
-        // Skip this segment entirely — don't add to output
-        i += 2 + segLen;
-        continue;
-      }
+      if (match) { i += 2 + segLen; continue; } // skip
     }
 
-    // Keep any other segment
+    // Check if this is our injected XMP APP1 (0xFFE1 + XMP namespace URI)
+    if (marker === 0xE1 && i + 4 + xmpNsLabel.length <= bytes.length) {
+      let match = true;
+      for (let j = 0; j < xmpNsLabel.length; j++) {
+        if (bytes[i + 4 + j] !== xmpNsLabel.charCodeAt(j)) { match = false; break; }
+      }
+      if (match) { i += 2 + segLen; continue; } // skip
+    }
+
+    // Keep any other segment unchanged
     const end = i + 2 + segLen;
     for (let k = i; k < end && k < bytes.length; k++) out.push(bytes[k]);
     i = end;
