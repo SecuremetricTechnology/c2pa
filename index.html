@@ -775,10 +775,7 @@
         <div class="card-body">
           <div class="manifest-field">
             <label class="manifest-label">LOAD A SIGNED IMAGE</label>
-            <input type="file" accept="image/*,.c2pa,application/json" class="manifest-input" id="verify-file" onchange="loadVerifyFile(event)" style="padding:7px 10px; cursor:pointer;">
-            <div style="font-family:var(--mono);font-size:10px;color:var(--muted);margin-top:6px;line-height:1.7;">
-              Accepts: signed <strong style="color:var(--text);">.jpg</strong> (Save to Files) or <strong style="color:var(--text);">.c2pa</strong> sidecar (for Photos-saved images)
-            </div>
+            <input type="file" accept="image/*" class="manifest-input" id="verify-file" onchange="loadVerifyFile(event)" style="padding:7px 10px; cursor:pointer;">
           </div>
 
           <!-- Verification in progress -->
@@ -836,12 +833,8 @@
       </div>
       <img id="result-img" style="width:100%; border-radius:8px; margin-bottom:14px;" alt="Signed">
       <div class="manifest-viewer" id="result-manifest"></div>
-      <div style="margin-top:12px; background:rgba(0,153,255,0.07); border:1px solid rgba(0,153,255,0.2); border-radius:10px; padding:10px 14px; font-family:var(--mono); font-size:10px; color:var(--accent2); line-height:1.7;" id="ios-save-hint" style="display:none;">
-        💡 <strong>iOS users:</strong> Tap <em>"Save Signed Image"</em> — choose <strong>Save to Files</strong> to preserve the C2PA manifest. Saving to Photos re-encodes the image and strips the manifest. Use the <strong>.c2pa sidecar</strong> file to verify images saved to Photos.
-      </div>
-      <div style="margin-top:10px; display:flex; flex-direction:column; gap:8px;">
-        <button class="btn-primary" onclick="downloadSigned()">⬇ Save Signed Image (.jpg)</button>
-        <button class="btn-icon" style="width:100%; justify-content:center;" onclick="downloadSidecar()">📄 Save Manifest Sidecar (.c2pa)</button>
+      <div style="margin-top:10px;" class="row-btns">
+        <button class="btn-primary" onclick="downloadSigned()">⬇ Download</button>
       </div>
       <button class="btn-icon" style="width:100%; margin-top:8px; justify-content:center;" onclick="resetCapture()">↩ Capture Another</button>
     </div>
@@ -873,7 +866,7 @@ const CONFIG = {
   LIFF_ID:        "2009585738-WxMZ4Cfw",          // replace before deploying
   CA_ENDPOINT:    "https://your-ca-backend.com", // your CA backend
   STORAGE_BUCKET: "https://your-storage.com",    // signed asset storage
-  APP_VERSION:    "0.4.alpha",
+  APP_VERSION:    "0.5.alpha",
   CLAIM_GENERATOR:"LINE-C2PA-App/1.0 c2pa/1.4",
   // For demo/dev: set USE_DEMO_MODE=true to bypass real LIFF+CA
   USE_DEMO_MODE:  false
@@ -1370,36 +1363,42 @@ async function signCapture() {
   try {
     await sleep(200);
 
-    // STEP 1: Hash the image
-    activateStep("step-hash");
     const imgBuffer = await State.capturedBlob.arrayBuffer();
-    const imgHash   = await crypto.subtle.digest("SHA-256", imgBuffer);
-    const imgHashB64 = arrayToBase64(imgHash);
+
+    // STEP 1: Hash the raw image bytes (before any embedding)
+    activateStep("step-hash");
+    const imgHashBytes = new Uint8Array(await crypto.subtle.digest("SHA-256", imgBuffer));
     await sleep(400);
     doneStep("step-hash");
 
-    // STEP 2: Build manifest
+    // STEP 2: Build CBOR-encoded C2PA claim + assertions
     activateStep("step-manifest");
-    const manifest = await buildManifest(imgHashB64);
-    await sleep(500);
+    const manifestJson = buildManifestJson(imgHashBytes);
+    const claimCbor    = encodeManifestCbor(manifestJson);
+    await sleep(400);
     doneStep("step-manifest");
 
-    // STEP 3: COSE sign
+    // STEP 3: COSE_Sign1 over the claim CBOR
+    // Protected header: { 1: -7 } = alg ES256
     activateStep("step-cose");
-    const manifestBytes   = new TextEncoder().encode(JSON.stringify(manifest));
-    const signatureBuffer = await crypto.subtle.sign(
+    const protectedHeader  = encodeCborMap({ 1: -7 });
+    const coseSignPayload  = buildCoseSigStructure(protectedHeader, claimCbor);
+    const rawSig           = new Uint8Array(await crypto.subtle.sign(
       { name: "ECDSA", hash: { name: "SHA-256" } },
       State.keyPair.privateKey,
-      manifestBytes
-    );
-    const signatureB64 = arrayToBase64(signatureBuffer);
+      coseSignPayload
+    ));
+    const certDer    = new Uint8Array(State.certificate);
+    const coseSign1  = buildCoseSign1(protectedHeader, claimCbor, rawSig, certDer);
     await sleep(600);
     doneStep("step-cose");
 
-    // STEP 4: Embed manifest into image (XMP/JUMBF simulation)
+    // STEP 4: Pack into JUMBF boxes and embed into JPEG APP11
     activateStep("step-embed");
-    const signedBlob = await embedManifestInImage(imgBuffer, manifest, signatureB64);
-    State.signedBlob = signedBlob;
+    const signedBlob = await embedJumbfInImage(imgBuffer, claimCbor, coseSign1, manifestJson);
+    State.signedBlob     = signedBlob;
+    State.signedManifest = manifestJson;
+    State.signedSig      = arrayToBase64(rawSig);
     await sleep(500);
     doneStep("step-embed");
 
@@ -1410,9 +1409,7 @@ async function signCapture() {
     await sleep(300);
 
     showOverlay(false);
-    State.signedManifest = manifest;
-    State.signedSig      = signatureB64;
-    showResult(manifest, signatureB64);
+    showResult(manifestJson, arrayToBase64(rawSig));
 
   } catch(e) {
     showOverlay(false);
@@ -1421,19 +1418,17 @@ async function signCapture() {
   }
 }
 
-async function buildManifest(imgHashB64) {
+// ═══════════════════════════════════════════════════════════════════════════
+// C2PA MANIFEST JSON (human-readable, also stored in sidecar)
+// ═══════════════════════════════════════════════════════════════════════════
+function buildManifestJson(imgHashBytes) {
   const now = new Date().toISOString();
   const p   = State.profile;
   return {
-    "@context": "https://c2pa.org/assertions",
     "dc:format": "image/jpeg",
     "dc:title":  id("meta-title").value || "Captured image",
     "claim_generator": CONFIG.CLAIM_GENERATOR,
-    "claim_generator_info": [{
-      "name": "LINE C2PA Mini App",
-      "version": CONFIG.APP_VERSION,
-      "icon": "https://line.me"
-    }],
+    "claim_generator_info": [{ "name": "LINE C2PA Mini App", "version": CONFIG.APP_VERSION }],
     "created": now,
     "producer": {
       "name": p.displayName || "LINE User",
@@ -1455,85 +1450,244 @@ async function buildManifest(imgHashB64) {
       ...(State.gpsCoords ? [{
         "label": "stds.exif",
         "data": {
-          "@type": "stds.exif",
           "exif:GPSLatitude":  State.gpsCoords.latitude,
           "exif:GPSLongitude": State.gpsCoords.longitude,
-          "exif:GPSAltitude":  State.gpsCoords.altitude || 0,
-          "exif:GPSTimeStamp": now
+          "exif:GPSAltitude":  State.gpsCoords.altitude || 0
         }
       }] : []),
       {
         "label": "c2pa.hash.data",
-        "data": {
-          "name": "jumbf manifest",
-          "alg": "sha256",
-          "hash": imgHashB64,
-          "pad": "0000000000000000"
-        }
+        "data": { "alg": "sha256", "hash": arrayToBase64(imgHashBytes) }
       }
-    ],
-    "signature_info": {
-      "cert_serial_number": arrayToHex(crypto.getRandomValues(new Uint8Array(8))),
-      "issuer": CONFIG.USE_DEMO_MODE ? "CN=LINE C2PA Demo CA" : "CN=LINE C2PA Root CA",
-      "time": now,
-      "public_key_spki": await exportPublicKeySPKI()
-    }
+    ]
   };
 }
 
-// Embed manifest into JPEG by appending a custom JUMBF-like APP11 segment
-async function embedManifestInImage(imgBuffer, manifest, signatureB64) {
-  const payload     = JSON.stringify({ manifest, signature: signatureB64, version: "1.0" });
-  const payloadBytes = new TextEncoder().encode(payload);
+// ═══════════════════════════════════════════════════════════════════════════
+// MINIMAL CBOR ENCODER
+// Implements only what C2PA needs: maps, arrays, strings, bytes, ints, bools
+// ═══════════════════════════════════════════════════════════════════════════
+function cborEncode(val) {
+  if (val === null || val === undefined) return new Uint8Array([0xf6]);
+  if (typeof val === "boolean") return new Uint8Array([val ? 0xf5 : 0xf4]);
 
-  // ── Segment 1: APP11 (0xFFEB) — full C2PA payload ─────────────────────────
-  // Survives "Save to Files" on iOS. Stripped by Photos re-encode.
-  const app11Marker  = new Uint8Array([0xFF, 0xEB]);
-  const app11Label   = new TextEncoder().encode("c2pa\x00");
-  const app11DataLen = app11Label.length + payloadBytes.length + 2;
-  const app11Len     = new Uint8Array([(app11DataLen >> 8) & 0xff, app11DataLen & 0xff]);
-  const app11Seg     = concatBytes(app11Marker, app11Len, app11Label, payloadBytes);
+  if (typeof val === "number") {
+    if (Number.isInteger(val)) {
+      if (val >= 0) return cborUint(0x00, val);
+      return cborUint(0x20, -1 - val);
+    }
+    // float64
+    const buf = new ArrayBuffer(9); const v = new DataView(buf);
+    v.setUint8(0, 0xfb); v.setFloat64(1, val, false);
+    return new Uint8Array(buf);
+  }
 
-  // ── Segment 2: APP1 XMP (0xFFE1) — compact fingerprint ────────────────────
-  // iOS Photos DOES preserve standard XMP (APP1 with Adobe XMP namespace).
-  // We embed a fingerprint: signer ID + image hash + signature prefix.
-  // This alone cannot be used to fully verify, but proves the image was
-  // signed and links it to the sidecar .c2pa file for full verification.
-  const hashAssertion = manifest.assertions?.find(a => a.label === "c2pa.hash.data");
-  const imgHash       = hashAssertion?.data?.hash || "";
-  const sigPrefix     = signatureB64.substring(0, 32);
-  const xmpXml = [
-    "<?xpacket begin='\uFEFF' id='W5M0MpCehiHzreSzNTczkc9d'?>",
-    "<x:xmpmeta xmlns:x='adobe:ns:meta/'>",
-    "  <rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>",
-    "    <rdf:Description rdf:about=''",
-    "      xmlns:c2pa='https://c2pa.org/assertions'",
-    "      xmlns:dc='http://purl.org/dc/elements/1.1/'",
-    "      xmlns:xmp='http://ns.adobe.com/xap/1.0/'>",
-    `      <c2pa:signer>${manifest.producer?.identifier || ""}</c2pa:signer>`,
-    `      <c2pa:created>${manifest.created || ""}</c2pa:created>`,
-    `      <c2pa:hash>${imgHash}</c2pa:hash>`,
-    `      <c2pa:sig_prefix>${sigPrefix}</c2pa:sig_prefix>`,
-    `      <c2pa:claim_generator>${manifest.claim_generator || ""}</c2pa:claim_generator>`,
-    `      <dc:title>${manifest["dc:title"] || ""}</dc:title>`,
-    "    </rdf:Description>",
-    "  </rdf:RDF>",
-    "</x:xmpmeta>",
-    "<?xpacket end='w'?>"
-  ].join("\n");
+  if (typeof val === "string") {
+    const enc  = new TextEncoder().encode(val);
+    return concatBytes(cborUint(0x60, enc.length), enc);
+  }
 
-  const xmpNs       = new TextEncoder().encode("http://ns.adobe.com/xap/1.0/\x00");
-  const xmpData     = new TextEncoder().encode(xmpXml);
-  const app1Body    = concatBytes(xmpNs, xmpData);
-  const app1BodyLen = app1Body.length + 2; // +2 for length field itself
-  const app1Marker  = new Uint8Array([0xFF, 0xE1]);
-  const app1Len     = new Uint8Array([(app1BodyLen >> 8) & 0xff, app1BodyLen & 0xff]);
-  const app1Seg     = concatBytes(app1Marker, app1Len, app1Body);
+  if (val instanceof Uint8Array || val instanceof ArrayBuffer) {
+    const b = val instanceof ArrayBuffer ? new Uint8Array(val) : val;
+    return concatBytes(cborUint(0x40, b.length), b);
+  }
 
-  // ── Assemble: SOI + XMP(APP1) + C2PA(APP11) + rest of image ──────────────
+  if (Array.isArray(val)) {
+    const items = val.map(cborEncode);
+    return concatBytes(cborUint(0x80, val.length), ...items);
+  }
+
+  if (typeof val === "object") {
+    const keys    = Object.keys(val);
+    const entries = keys.flatMap(k => [cborEncode(k), cborEncode(val[k])]);
+    return concatBytes(cborUint(0xa0, keys.length), ...entries);
+  }
+
+  return new Uint8Array([0xf6]);
+}
+
+function cborUint(majorShifted, n) {
+  if (n <= 23)         return new Uint8Array([majorShifted | n]);
+  if (n <= 0xff)       return new Uint8Array([majorShifted | 24, n]);
+  if (n <= 0xffff)     return new Uint8Array([majorShifted | 25, (n>>8)&0xff, n&0xff]);
+  if (n <= 0xffffffff) return new Uint8Array([majorShifted | 26, (n>>24)&0xff, (n>>16)&0xff, (n>>8)&0xff, n&0xff]);
+  return new Uint8Array([majorShifted | 27, 0,0,0,0, (n>>24)&0xff, (n>>16)&0xff, (n>>8)&0xff, n&0xff]);
+}
+
+// CBOR-encode a plain JS object as a map (integer or string keys)
+function encodeCborMap(obj) {
+  return cborEncode(obj);
+}
+
+// Encode the full C2PA manifest as CBOR
+function encodeManifestCbor(manifestJson) {
+  return cborEncode(manifestJson);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// COSE_Sign1  (RFC 8152)
+// Structure:  Tag(18) [ protected_bstr, unprotected_map, payload_bstr, signature_bstr ]
+// ═══════════════════════════════════════════════════════════════════════════
+function buildCoseSigStructure(protectedHeaderBytes, payloadBytes) {
+  // Sig_Structure = ["Signature1", protected_bstr, aad_bstr, payload_bstr]
+  const sigStruct = cborEncode([
+    "Signature1",
+    protectedHeaderBytes,
+    new Uint8Array(0),   // empty AAD
+    payloadBytes
+  ]);
+  return sigStruct;
+}
+
+function buildCoseSign1(protectedHeaderBytes, payloadBytes, sigBytes, certDerBytes) {
+  // COSE_Sign1 = Tag(18) [ protected_bstr, { x5chain: [cert_bstr] }, payload_bstr, sig_bstr ]
+  // unprotected header: { 33: [certDer] }  (33 = x5chain)
+  const unprotected = new Map();
+  // Encode unprotected header manually: {33: [cert]}
+  const certArray   = cborEncode([certDerBytes]);
+  const unprotBytes = concatBytes(
+    new Uint8Array([0xa1]),       // map(1)
+    new Uint8Array([0x18, 0x21]), // key 33
+    certArray
+  );
+
+  // COSE_Sign1 array (without tag for simplicity — validators accept both)
+  const coseArray = concatBytes(
+    new Uint8Array([0x84]),        // array(4)
+    cborEncode(protectedHeaderBytes),
+    unprotBytes,
+    cborEncode(payloadBytes),
+    cborEncode(sigBytes)
+  );
+
+  // Wrap in CBOR tag 18
+  return concatBytes(new Uint8Array([0xd2]), coseArray);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// JUMBF BOX BUILDER  (ISO 19566-5)
+// Each box: LBox(4) + TBox(4) + [XLBox(8)] + UUID(16) + ToggleBox(1) + Label + payload
+// ═══════════════════════════════════════════════════════════════════════════
+
+// UUIDs defined by C2PA spec
+const JUMBF_UUID = {
+  MANIFEST_STORE:  hexBytes("6332706100110010800000aa00389b71"), // c2pa manifest store
+  MANIFEST:        hexBytes("6332706100110010800000aa00389b71"), // same for manifest box
+  CLAIM:           hexBytes("6332636c00110010800000aa00389b71"), // c2cl
+  COSE:            hexBytes("6332637300110010800000aa00389b71"), // c2cs
+  ASSERTION_STORE: hexBytes("6332617300110010800000aa00389b71"), // c2as
+  ASSERTION:       hexBytes("6332617400110010800000aa00389b71"), // c2at
+  JSON:            hexBytes("6a736f6e00110010800000aa00389b71"), // json
+  CBOR:            hexBytes("63626f7200110010800000aa00389b71"), // cbor
+};
+
+function jumbfBox(typeUuid, label, payload, descFlags) {
+  // Description box: UUID(16) + toggles(1) + label(n) + NUL
+  const labelBytes  = new TextEncoder().encode(label + "\x00");
+  const toggleByte  = new Uint8Array([descFlags || 0x03]); // requestable + labelled
+  const descContent = concatBytes(typeUuid, toggleByte, labelBytes);
+
+  // jumd box (description): LBox + "jumd" + content
+  const jumdPayload = descContent;
+  const jumdTBox    = new TextEncoder().encode("jumd");
+  const jumdLen     = 8 + jumdPayload.length;
+  const jumdLenBuf  = new Uint8Array(4);
+  new DataView(jumdLenBuf.buffer).setUint32(0, jumdLen, false);
+  const jumdBox_    = concatBytes(jumdLenBuf, jumdTBox, jumdPayload);
+
+  // content box
+  const payloadBytes = payload instanceof Uint8Array ? payload : new Uint8Array(payload);
+
+  // superbox: LBox + "jumb" + jumdBox + contentBox
+  const jumbTBox   = new TextEncoder().encode("jumb");
+  const innerBytes = concatBytes(jumdBox_, payloadBytes);
+  const totalLen   = 8 + innerBytes.length;
+  const lenBuf     = new Uint8Array(4);
+  new DataView(lenBuf.buffer).setUint32(0, totalLen, false);
+  return concatBytes(lenBuf, jumbTBox, innerBytes);
+}
+
+function jumbfLeafBox(tboxStr, payload) {
+  // Simple leaf: LBox(4) + TBox(4) + payload
+  const tbox   = new TextEncoder().encode(tboxStr.padEnd(4).slice(0,4));
+  const p      = payload instanceof Uint8Array ? payload : new Uint8Array(payload);
+  const total  = 8 + p.length;
+  const lenBuf = new Uint8Array(4);
+  new DataView(lenBuf.buffer).setUint32(0, total, false);
+  return concatBytes(lenBuf, tbox, p);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ASSEMBLE FULL JUMBF MANIFEST STORE + EMBED IN JPEG
+// ═══════════════════════════════════════════════════════════════════════════
+async function embedJumbfInImage(imgBuffer, claimCbor, coseSign1, manifestJson) {
+  const label = "urn:uuid:" + arrayToHex(crypto.getRandomValues(new Uint8Array(16)));
+
+  // 1. JSON assertion box (c2pa.actions)
+  const actionsJson  = new TextEncoder().encode(JSON.stringify(manifestJson.assertions[0].data));
+  const assertionBox = jumbfBox(
+    JUMBF_UUID.JSON,
+    "c2pa.actions",
+    jumbfLeafBox("json", actionsJson)
+  );
+
+  // 2. Assertion store
+  const assertionStore = jumbfBox(
+    JUMBF_UUID.ASSERTION_STORE,
+    "c2pa.assertions",
+    assertionBox
+  );
+
+  // 3. Claim box (CBOR-encoded manifest)
+  const claimBox = jumbfBox(
+    JUMBF_UUID.CBOR,
+    "c2pa.claim",
+    jumbfLeafBox("cbor", claimCbor)
+  );
+
+  // 4. Signature box (COSE_Sign1)
+  const sigBox = jumbfBox(
+    JUMBF_UUID.COSE,
+    "c2pa.signature",
+    jumbfLeafBox("bidb", coseSign1)
+  );
+
+  // 5. Manifest box (contains assertion store + claim + sig)
+  const manifestBox = jumbfBox(
+    JUMBF_UUID.MANIFEST,
+    label,
+    concatBytes(assertionStore, claimBox, sigBox)
+  );
+
+  // 6. Manifest store (top-level container)
+  const manifestStore = jumbfBox(
+    JUMBF_UUID.MANIFEST_STORE,
+    "c2pa",
+    manifestBox
+  );
+
+  // 7. Wrap in JPEG APP11 segment (marker 0xFFEB)
+  // APP11 for C2PA: marker(2) + length(2) + CI(2) + En(2) + Z(4) + LBox content
+  const ci     = new Uint8Array([0x4A, 0x50]); // "JP"
+  const en     = new Uint8Array([0x02, 0x00]); // box instance number
+  const z      = new Uint8Array([0x00, 0x00, 0x00, 0x01]); // sequence number
+  const app11Body   = concatBytes(ci, en, z, manifestStore);
+  const app11SegLen = app11Body.length + 2; // +2 for length field itself
+  if (app11SegLen > 0xFFFF) throw new Error("Manifest too large for single APP11 segment");
+  const app11Marker = new Uint8Array([0xFF, 0xEB]);
+  const app11Len    = new Uint8Array([(app11SegLen >> 8) & 0xff, app11SegLen & 0xff]);
+  const app11Seg    = concatBytes(app11Marker, app11Len, app11Body);
+
+  // Also keep a fallback custom segment for internal verify tab
+  const fallbackPayload  = new TextEncoder().encode(JSON.stringify({ manifest: manifestJson, signature: arrayToBase64(new Uint8Array(coseSign1)), version: "2.0" }));
+  const fallbackLabel    = new TextEncoder().encode("c2pa\x00");
+  const fallbackLen      = fallbackLabel.length + fallbackPayload.length + 2;
+  const fallbackLenBytes = new Uint8Array([(fallbackLen >> 8) & 0xff, fallbackLen & 0xff]);
+  const fallbackSeg      = concatBytes(new Uint8Array([0xFF, 0xEB]), fallbackLenBytes, fallbackLabel, fallbackPayload);
+
+  // 8. Insert both segments right after SOI
   const orig   = new Uint8Array(imgBuffer);
-  const result = concatBytes(orig.slice(0, 2), app1Seg, app11Seg, orig.slice(2));
-
+  const result = concatBytes(orig.slice(0, 2), app11Seg, fallbackSeg, orig.slice(2));
   return new Blob([result], { type: "image/jpeg" });
 }
 
@@ -1557,15 +1711,12 @@ function showResult(manifest, signatureB64) {
     "cose_signature": signatureB64.substring(0, 32) + "…",
   }, null, 2));
 
-  maybeShowIOSHint();
   showToast("Image signed successfully!", "success");
 }
 
 function resetCapture() {
-  State.capturedBlob   = null;
-  State.signedBlob     = null;
-  State.signedManifest = null;
-  State.signedSig      = null;
+  State.capturedBlob = null;
+  State.signedBlob   = null;
   hide("result-section");
   hide("preview-section");
   hide("manifest-form");
@@ -1584,29 +1735,6 @@ async function loadVerifyFile(event) {
   hide("verify-result");
   show("verify-progress");
   setText("verify-progress-label", "Extracting manifest…");
-
-  // ── Sidecar .c2pa file path ───────────────────────────────────────────────
-  if (file.name.endsWith(".c2pa") || file.type === "application/json") {
-    setText("verify-progress-label", "Reading sidecar manifest…");
-    await sleep(200);
-    try {
-      const text    = await file.text();
-      const sidecar = JSON.parse(text);
-      if (!sidecar.manifest || !sidecar.signature) throw new Error("Invalid sidecar format");
-
-      hide("verify-progress");
-      // For sidecar we cannot re-hash the image (we don't have it),
-      // so we verify only the signature and manifest structure.
-      await verifySidecar(sidecar.manifest, sidecar.signature);
-    } catch(e) {
-      hide("verify-progress");
-      renderVerifyResult([{
-        id: "parse", label: "Sidecar Parse", pass: false,
-        desc: "Could not parse .c2pa file: " + e.message, critical: true
-      }], null, false, "Invalid Sidecar", e.message);
-    }
-    return;
-  }
 
   const buffer = await file.arrayBuffer();
   await sleep(300);
@@ -1810,102 +1938,6 @@ async function loadVerifyFile(event) {
 }
 
 // ── Render the full result UI ──────────────────────────────────────────────
-// ── Verify a .c2pa sidecar (no image available — skips hash check) ────────────
-async function verifySidecar(manifest, signatureB64) {
-  const checks = [];
-
-  // Structure check
-  const hasRequiredFields = !!(manifest.claim_generator && manifest.created &&
-    manifest.producer && Array.isArray(manifest.assertions));
-  checks.push({
-    id: "manifest_structure", label: "Manifest Structure Valid",
-    desc: hasRequiredFields ? "Required fields present ✓" : "Missing required manifest fields",
-    pass: hasRequiredFields,
-  });
-
-  // Hash check — skipped (no image)
-  checks.push({
-    id: "image_hash", label: "Image Hash Integrity",
-    desc: "⚠ Skipped — sidecar verification does not include the original image. Load the original signed .jpg to verify pixel integrity.",
-    pass: true, // not a failure — just not possible without the image
-  });
-
-  // Signature check
-  let sigValid = false, sigDesc = "";
-  if (!signatureB64) {
-    sigDesc = "No signature in sidecar";
-  } else {
-    const manifestBytes = new TextEncoder().encode(JSON.stringify(manifest));
-    const sigBytes      = base64ToArray(signatureB64);
-
-    // Try current user key
-    if (State.keyPair?.publicKey) {
-      try {
-        sigValid = await crypto.subtle.verify(
-          { name: "ECDSA", hash: { name: "SHA-256" } },
-          State.keyPair.publicKey, sigBytes, manifestBytes
-        );
-        sigDesc = sigValid
-          ? "ECDSA P-256 valid — signed by this device"
-          : "Invalid for this device key";
-      } catch(e) { sigDesc = "Verification error: " + e.message; }
-    }
-
-    // Try embedded public key
-    if (!sigValid && manifest.signature_info?.public_key_spki) {
-      try {
-        const spki   = base64ToArray(manifest.signature_info.public_key_spki);
-        const pubKey = await crypto.subtle.importKey(
-          "spki", spki, { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]
-        );
-        sigValid = await crypto.subtle.verify(
-          { name: "ECDSA", hash: { name: "SHA-256" } },
-          pubKey, sigBytes, manifestBytes
-        );
-        sigDesc = sigValid
-          ? "ECDSA P-256 valid — verified against embedded public key"
-          : "Signature does not match embedded public key";
-      } catch(e) { sigDesc = "Key import error: " + e.message; }
-    }
-
-    if (!sigDesc) sigDesc = "Public key not available for verification";
-  }
-  checks.push({
-    id: "signature", label: "Cryptographic Signature",
-    desc: sigDesc, pass: sigValid, critical: true,
-  });
-
-  // Identity
-  const producer = manifest.producer;
-  checks.push({
-    id: "identity", label: "Signer Identity",
-    desc: producer
-      ? `Producer: ${producer.name} (${producer.identifier || "no ID"})`
-      : "No producer info",
-    pass: !!producer,
-  });
-
-  // Timestamp
-  const created  = manifest.created ? new Date(manifest.created) : null;
-  const inFuture = created && created > new Date();
-  checks.push({
-    id: "timestamp", label: "Timestamp Plausible",
-    desc: created ? (inFuture ? `Future timestamp: ${created.toLocaleString()}` : `Signed ${formatRelative(created)}`) : "No timestamp",
-    pass: !!created && !inFuture,
-  });
-
-  const critFailed = checks.filter(c => c.critical && !c.pass);
-  const allPassed  = checks.filter(c => !c.pass).length === 0;
-  hide("verify-progress");
-  renderVerifyResult(
-    checks, manifest,
-    allPassed && critFailed.length === 0,
-    critFailed.length > 0 ? "Invalid Sidecar" : allPassed ? "Sidecar Authentic" : "Partially Verified",
-    critFailed.length > 0 ? critFailed.map(c => c.label).join(" · ") + " failed"
-      : "Note: pixel integrity not checked — load the original .jpg for full verification"
-  );
-}
-
 function renderVerifyResult(checks, manifest, isValid, verdict, sub) {
   show("verify-result");
 
@@ -1990,55 +2022,44 @@ function extractManifestFromImage(buffer) {
   return null;
 }
 
-// ── Strip all C2PA-injected segments from a JPEG buffer ──────────────────
-// Removes both our APP11 (c2pa label) and our APP1 XMP segment so the
-// re-hashed bytes exactly match what was hashed at signing time
-// (which was the original camera JPEG before any embedding).
+// ── Strip all C2PA-injected APP11 segments from a JPEG buffer ────────────
+// Strips JUMBF APP11 (JP marker), fallback c2pa\x00 APP11, and injected XMP APP1
+// so that re-hashing restores the exact original camera JPEG bytes.
 function stripManifestSegment(buffer) {
-  const bytes      = new Uint8Array(buffer);
-  const c2paLabel  = "c2pa\x00";
-  const xmpNsLabel = "http://ns.adobe.com/xap/1.0/\x00";
-  const out        = [];
-  let   i          = 0;
+  const bytes    = new Uint8Array(buffer);
+  const c2paLbl  = [0x63,0x32,0x70,0x61,0x00]; // "c2pa\0"
+  const xmpStart = [0x68,0x74,0x74,0x70,0x3a,0x2f,0x2f]; // "http://"
+  const jpMark   = [0x4A, 0x50]; // "JP" — JUMBF C2PA APP11
+  const out      = [];
+  let   i        = 0;
 
-  // Keep SOI (first 2 bytes)
-  out.push(bytes[0], bytes[1]);
-  i = 2;
+  out.push(bytes[0], bytes[1]); i = 2; // SOI
 
   while (i < bytes.length - 1) {
     if (bytes[i] !== 0xFF) { out.push(bytes[i++]); continue; }
-
     const marker = bytes[i+1];
-
-    // SOI / EOI — no length field
-    if (marker === 0xD8 || marker === 0xD9) {
-      out.push(bytes[i], bytes[i+1]);
-      i += 2;
-      continue;
-    }
-
+    if (marker === 0xD8 || marker === 0xD9) { out.push(bytes[i], bytes[i+1]); i += 2; continue; }
     if (i + 3 >= bytes.length) { out.push(bytes[i++]); continue; }
     const segLen = (bytes[i+2] << 8) | bytes[i+3];
 
-    // Check if this is our APP11 c2pa segment (0xFFEB + "c2pa " label)
-    if (marker === 0xEB && i + 4 + c2paLabel.length <= bytes.length) {
-      let match = true;
-      for (let j = 0; j < c2paLabel.length; j++) {
-        if (bytes[i + 4 + j] !== c2paLabel.charCodeAt(j)) { match = false; break; }
+    if (marker === 0xEB && i + 5 < bytes.length) {
+      // Strip JUMBF APP11 (C2PA spec: starts with "JP" at byte offset +4)
+      if (bytes[i+4] === jpMark[0] && bytes[i+5] === jpMark[1]) {
+        i += 2 + segLen; continue;
       }
-      if (match) { i += 2 + segLen; continue; } // skip
+      // Strip fallback c2pa\0 APP11
+      let mc = (i + 4 + c2paLbl.length <= bytes.length);
+      if (mc) for (let j = 0; j < c2paLbl.length; j++) if (bytes[i+4+j] !== c2paLbl[j]) { mc=false; break; }
+      if (mc) { i += 2 + segLen; continue; }
     }
 
-    // Check if this is our injected XMP APP1 (0xFFE1 + XMP namespace URI)
-    if (marker === 0xE1 && i + 4 + xmpNsLabel.length <= bytes.length) {
-      let match = true;
-      for (let j = 0; j < xmpNsLabel.length; j++) {
-        if (bytes[i + 4 + j] !== xmpNsLabel.charCodeAt(j)) { match = false; break; }
-      }
-      if (match) { i += 2 + segLen; continue; } // skip
+    // Strip injected XMP APP1 (our namespace starts with "http://")
+    if (marker === 0xE1 && i + 4 + xmpStart.length <= bytes.length) {
+      let mx = true;
+      for (let j = 0; j < xmpStart.length; j++) if (bytes[i+4+j] !== xmpStart[j]) { mx=false; break; }
+      if (mx) { i += 2 + segLen; continue; }
     }
 
-    // Keep any other segment unchanged
     const end = i + 2 + segLen;
     for (let k = i; k < end && k < bytes.length; k++) out.push(bytes[k]);
     i = end;
@@ -2060,150 +2081,45 @@ function formatRelative(date) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// DOWNLOAD + SIDECAR
+// DOWNLOAD + SHARE
 // ═══════════════════════════════════════════════════════════════════════════
-
-function isIOS() {
-  return /iPad|iPhone|iPod/.test(navigator.userAgent) ||
-    (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
-}
-
-// Show the iOS info banner in result section
-function maybeShowIOSHint() {
-  if (isIOS()) {
-    const hint = id("ios-save-hint");
-    if (hint) hint.style.display = "block";
-  }
-}
-
-async function downloadSigned() {
+function downloadSigned() {
   if (!State.signedBlob) return;
-  const ts       = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-  const fileName = `c2pa-signed-${ts}.jpg`;
-
-  if (isIOS()) {
-    // iOS: Web Share API invokes the native OS share sheet,
-    // bypassing LINE WebView popup restrictions entirely.
-    // IMPORTANT: Tell the user to choose "Save to Files" not "Save Image"
-    // because "Save Image" triggers Photos re-encode which strips APP11.
-    if (navigator.share && navigator.canShare) {
-      const file = new File([State.signedBlob], fileName, { type: "image/jpeg" });
-      if (navigator.canShare({ files: [file] })) {
-        try {
-          await navigator.share({ files: [file], title: "C2PA Signed Image" });
-          showToast("Use Save to Files to keep C2PA manifest", "success");
-          return;
-        } catch (e) {
-          if (e.name === "AbortError") return;
-          // fall through to modal
-        }
-      }
-    }
-    // Fallback: inline modal — user long-presses to save
-    const url = URL.createObjectURL(State.signedBlob);
-    showIOSSaveModal(url, fileName);
-
-  } else {
-    // Android / desktop
-    const url = URL.createObjectURL(State.signedBlob);
-    const a   = document.createElement("a");
-    a.href     = url;
-    a.download = fileName;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    setTimeout(() => URL.revokeObjectURL(url), 5000);
-    showToast("Downloading…", "success");
-  }
+  const url  = URL.createObjectURL(State.signedBlob);
+  
+  // Open in new tab
+  window.open(url, "_blank");
+  
+  //below code might not work in iOS
+  /*
+  const a    = document.createElement("a");
+  const ts   = new Date().toISOString().replace(/[:.]/g,"-").slice(0,19);
+  a.href = url; a.download = `c2pa-signed-${ts}.jpg`;
+  a.click();
+  URL.revokeObjectURL(url);
+  */
+  
+  showToast("Downloading signed image…", "success");
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
 }
 
-// Download the manifest + signature as a .c2pa sidecar JSON file.
-// This is the verification source for images that went through Photos re-encode.
-async function downloadSidecar() {
-  if (!State.signedManifest || !State.signedSig) {
-    showToast("No signed manifest in memory", "error");
+async function shareToLine() {
+  if (!State.signedBlob) return;
+  if (CONFIG.USE_DEMO_MODE || !window.liff) {
+    showToast("LINE share requires real LIFF context", "error");
     return;
   }
-  const ts       = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-  const fileName = `c2pa-sidecar-${ts}.c2pa`;
-  const sidecar  = JSON.stringify({
-    version:   "1.0",
-    format:    "c2pa-sidecar",
-    manifest:  State.signedManifest,
-    signature: State.signedSig,
-    note:      "Use this file to verify the corresponding signed JPEG via the C2PA verify tab."
-  }, null, 2);
-
-  const blob = new Blob([sidecar], { type: "application/json" });
-
-  if (isIOS() && navigator.share && navigator.canShare) {
-    const file = new File([blob], fileName, { type: "application/json" });
-    if (navigator.canShare({ files: [file] })) {
-      try {
-        await navigator.share({ files: [file], title: "C2PA Manifest Sidecar" });
-        showToast("Sidecar saved!", "success");
-        return;
-      } catch(e) {
-        if (e.name === "AbortError") return;
-      }
-    }
+  try {
+    // In a real app, upload to your storage first to get a URL, then share
+    await liff.shareTargetPicker([{
+      type: "image",
+      originalContentUrl: "https://your-storage.com/signed-image.jpg",
+      previewImageUrl: "https://your-storage.com/signed-image.jpg"
+    }]);
+    showToast("Shared to LINE!", "success");
+  } catch(e) {
+    showToast("Share failed: " + e.message, "error");
   }
-
-  // Fallback: anchor download
-  const url = URL.createObjectURL(blob);
-  const a   = document.createElement("a");
-  a.href     = url;
-  a.download = fileName;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  setTimeout(() => URL.revokeObjectURL(url), 5000);
-  showToast("Sidecar downloaded!", "success");
-}
-
-function showIOSSaveModal(blobUrl, fileName) {
-  const existing = document.getElementById("ios-save-modal");
-  if (existing) existing.remove();
-
-  const modal = document.createElement("div");
-  modal.id = "ios-save-modal";
-  modal.style.cssText = [
-    "position:fixed; inset:0; z-index:300;",
-    "background:rgba(10,12,16,0.97);",
-    "display:flex; flex-direction:column;",
-    "align-items:center; justify-content:center;",
-    "gap:16px; padding:24px;",
-    "backdrop-filter:blur(10px);"
-  ].join("");
-
-  const title = document.createElement("div");
-  title.style.cssText = "font-family:var(--sans);font-weight:800;font-size:17px;color:var(--text);";
-  title.textContent = "Save Signed Image";
-
-  const warn = document.createElement("div");
-  warn.style.cssText = "font-family:var(--mono);font-size:11px;background:rgba(0,153,255,0.1);border:1px solid rgba(0,153,255,0.25);border-radius:8px;padding:10px 12px;color:var(--accent2);line-height:1.7;text-align:center;";
-  warn.innerHTML = 'Long-press the image, then tap<br><strong>"Save to Files"</strong> (not "Save Image")<br>to preserve the C2PA manifest.';
-
-  const img = document.createElement("img");
-  img.src = blobUrl;
-  img.alt = "Long-press to save";
-  img.style.cssText = "max-width:100%;max-height:45vh;border-radius:12px;border:1px solid var(--border);object-fit:contain;";
-
-  const fileLabel = document.createElement("div");
-  fileLabel.style.cssText = "font-family:var(--mono);font-size:10px;color:var(--muted);";
-  fileLabel.textContent = fileName;
-
-  const closeBtn = document.createElement("button");
-  closeBtn.style.cssText = "padding:12px 36px;border-radius:10px;border:1px solid var(--border);background:transparent;color:var(--text);font-family:var(--sans);font-weight:600;font-size:14px;cursor:pointer;";
-  closeBtn.textContent = "Done";
-  closeBtn.onclick = () => modal.remove();
-
-  modal.appendChild(title);
-  modal.appendChild(warn);
-  modal.appendChild(img);
-  modal.appendChild(fileLabel);
-  modal.appendChild(closeBtn);
-  document.body.appendChild(modal);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2336,7 +2252,7 @@ window.addEventListener("DOMContentLoaded", () => {
 
 //add apps version into display
 setText ("ver-status-txt",CONFIG.APP_VERSION);
-
+dot("ver-dot",true);
 </script>
 </body>
 </html>
