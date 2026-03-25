@@ -1826,8 +1826,7 @@ async function verifySidecar(manifest, signatureB64) {
   // Hash check — skipped (no image)
   checks.push({
     id: "image_hash", label: "Image Hash Integrity",
-    desc: "⚠ Skipped — sidecar verification does not include the original image.
-Load the original signed .jpg to verify pixel integrity.",
+    desc: "⚠ Skipped — sidecar verification does not include the original image. Load the original signed .jpg to verify pixel integrity.",
     pass: true, // not a failure — just not possible without the image
   });
 
@@ -2177,7 +2176,7 @@ function showIOSSaveModal(blobUrl, fileName) {
 
   const warn = document.createElement("div");
   warn.style.cssText = "font-family:var(--mono);font-size:11px;background:rgba(0,153,255,0.1);border:1px solid rgba(0,153,255,0.25);border-radius:8px;padding:10px 12px;color:var(--accent2);line-height:1.7;text-align:center;";
-  warn.innerHTML = "Long-press the image, then tap<br><strong>"Save to Files"</strong> (not "Save Image")<br>to preserve the C2PA manifest.";
+  warn.innerHTML = 'Long-press the image, then tap<br><strong>"Save to Files"</strong> (not "Save Image")<br>to preserve the C2PA manifest.';
 
   const img = document.createElement("img");
   img.src = blobUrl;
