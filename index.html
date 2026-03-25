@@ -866,7 +866,7 @@ const CONFIG = {
   LIFF_ID:        "2009585738-WxMZ4Cfw",          // replace before deploying
   CA_ENDPOINT:    "https://your-ca-backend.com", // your CA backend
   STORAGE_BUCKET: "https://your-storage.com",    // signed asset storage
-  APP_VERSION:    "0.5.alpha",
+  APP_VERSION:    "0.3.0",
   CLAIM_GENERATOR:"LINE-C2PA-App/1.0 c2pa/1.4",
   // For demo/dev: set USE_DEMO_MODE=true to bypass real LIFF+CA
   USE_DEMO_MODE:  false
@@ -1363,42 +1363,36 @@ async function signCapture() {
   try {
     await sleep(200);
 
-    const imgBuffer = await State.capturedBlob.arrayBuffer();
-
-    // STEP 1: Hash the raw image bytes (before any embedding)
+    // STEP 1: Hash the image
     activateStep("step-hash");
-    const imgHashBytes = new Uint8Array(await crypto.subtle.digest("SHA-256", imgBuffer));
+    const imgBuffer = await State.capturedBlob.arrayBuffer();
+    const imgHash   = await crypto.subtle.digest("SHA-256", imgBuffer);
+    const imgHashB64 = arrayToBase64(imgHash);
     await sleep(400);
     doneStep("step-hash");
 
-    // STEP 2: Build CBOR-encoded C2PA claim + assertions
+    // STEP 2: Build manifest
     activateStep("step-manifest");
-    const manifestJson = buildManifestJson(imgHashBytes);
-    const claimCbor    = encodeManifestCbor(manifestJson);
-    await sleep(400);
+    const manifest = await buildManifest(imgHashB64);
+    await sleep(500);
     doneStep("step-manifest");
 
-    // STEP 3: COSE_Sign1 over the claim CBOR
-    // Protected header: { 1: -7 } = alg ES256
+    // STEP 3: COSE sign
     activateStep("step-cose");
-    const protectedHeader  = encodeCborMap({ 1: -7 });
-    const coseSignPayload  = buildCoseSigStructure(protectedHeader, claimCbor);
-    const rawSig           = new Uint8Array(await crypto.subtle.sign(
+    const manifestBytes   = new TextEncoder().encode(JSON.stringify(manifest));
+    const signatureBuffer = await crypto.subtle.sign(
       { name: "ECDSA", hash: { name: "SHA-256" } },
       State.keyPair.privateKey,
-      coseSignPayload
-    ));
-    const certDer    = new Uint8Array(State.certificate);
-    const coseSign1  = buildCoseSign1(protectedHeader, claimCbor, rawSig, certDer);
+      manifestBytes
+    );
+    const signatureB64 = arrayToBase64(signatureBuffer);
     await sleep(600);
     doneStep("step-cose");
 
-    // STEP 4: Pack into JUMBF boxes and embed into JPEG APP11
+    // STEP 4: Embed manifest into image (XMP/JUMBF simulation)
     activateStep("step-embed");
-    const signedBlob = await embedJumbfInImage(imgBuffer, claimCbor, coseSign1, manifestJson);
-    State.signedBlob     = signedBlob;
-    State.signedManifest = manifestJson;
-    State.signedSig      = arrayToBase64(rawSig);
+    const signedBlob = await embedManifestInImage(imgBuffer, manifest, signatureB64);
+    State.signedBlob = signedBlob;
     await sleep(500);
     doneStep("step-embed");
 
@@ -1409,7 +1403,7 @@ async function signCapture() {
     await sleep(300);
 
     showOverlay(false);
-    showResult(manifestJson, arrayToBase64(rawSig));
+    showResult(manifest, signatureB64);
 
   } catch(e) {
     showOverlay(false);
@@ -1418,17 +1412,19 @@ async function signCapture() {
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// C2PA MANIFEST JSON (human-readable, also stored in sidecar)
-// ═══════════════════════════════════════════════════════════════════════════
-function buildManifestJson(imgHashBytes) {
+async function buildManifest(imgHashB64) {
   const now = new Date().toISOString();
   const p   = State.profile;
   return {
+    "@context": "https://c2pa.org/assertions",
     "dc:format": "image/jpeg",
     "dc:title":  id("meta-title").value || "Captured image",
     "claim_generator": CONFIG.CLAIM_GENERATOR,
-    "claim_generator_info": [{ "name": "LINE C2PA Mini App", "version": CONFIG.APP_VERSION }],
+    "claim_generator_info": [{
+      "name": "LINE C2PA Mini App",
+      "version": CONFIG.APP_VERSION,
+      "icon": "https://line.me"
+    }],
     "created": now,
     "producer": {
       "name": p.displayName || "LINE User",
@@ -1450,244 +1446,49 @@ function buildManifestJson(imgHashBytes) {
       ...(State.gpsCoords ? [{
         "label": "stds.exif",
         "data": {
+          "@type": "stds.exif",
           "exif:GPSLatitude":  State.gpsCoords.latitude,
           "exif:GPSLongitude": State.gpsCoords.longitude,
-          "exif:GPSAltitude":  State.gpsCoords.altitude || 0
+          "exif:GPSAltitude":  State.gpsCoords.altitude || 0,
+          "exif:GPSTimeStamp": now
         }
       }] : []),
       {
         "label": "c2pa.hash.data",
-        "data": { "alg": "sha256", "hash": arrayToBase64(imgHashBytes) }
+        "data": {
+          "name": "jumbf manifest",
+          "alg": "sha256",
+          "hash": imgHashB64,
+          "pad": "0000000000000000"
+        }
       }
-    ]
+    ],
+    "signature_info": {
+      "cert_serial_number": arrayToHex(crypto.getRandomValues(new Uint8Array(8))),
+      "issuer": CONFIG.USE_DEMO_MODE ? "CN=LINE C2PA Demo CA" : "CN=LINE C2PA Root CA",
+      "time": now,
+      "public_key_spki": await exportPublicKeySPKI()
+    }
   };
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// MINIMAL CBOR ENCODER
-// Implements only what C2PA needs: maps, arrays, strings, bytes, ints, bools
-// ═══════════════════════════════════════════════════════════════════════════
-function cborEncode(val) {
-  if (val === null || val === undefined) return new Uint8Array([0xf6]);
-  if (typeof val === "boolean") return new Uint8Array([val ? 0xf5 : 0xf4]);
+// Embed manifest into JPEG by appending a custom JUMBF-like APP11 segment
+async function embedManifestInImage(imgBuffer, manifest, signatureB64) {
+  const payload = JSON.stringify({ manifest, signature: signatureB64, version: "1.0" });
+  const payloadBytes = new TextEncoder().encode(payload);
 
-  if (typeof val === "number") {
-    if (Number.isInteger(val)) {
-      if (val >= 0) return cborUint(0x00, val);
-      return cborUint(0x20, -1 - val);
-    }
-    // float64
-    const buf = new ArrayBuffer(9); const v = new DataView(buf);
-    v.setUint8(0, 0xfb); v.setFloat64(1, val, false);
-    return new Uint8Array(buf);
-  }
+  // Build a JPEG APP11 segment (marker 0xFFEB) to hold our C2PA data
+  // Real C2PA uses JUMBF boxes inside APP11; this is a simplified container
+  const marker      = new Uint8Array([0xFF, 0xEB]);
+  const label       = new TextEncoder().encode("c2pa\x00");
+  const dataLen     = label.length + payloadBytes.length + 2; // +2 for length field
+  const lenBytes    = new Uint8Array([(dataLen >> 8) & 0xff, dataLen & 0xff]);
+  const segment     = concatBytes(marker, lenBytes, label, payloadBytes);
 
-  if (typeof val === "string") {
-    const enc  = new TextEncoder().encode(val);
-    return concatBytes(cborUint(0x60, enc.length), enc);
-  }
+  // Find SOI (0xFFD8) + insert after it
+  const orig = new Uint8Array(imgBuffer);
+  const result = concatBytes(orig.slice(0, 2), segment, orig.slice(2));
 
-  if (val instanceof Uint8Array || val instanceof ArrayBuffer) {
-    const b = val instanceof ArrayBuffer ? new Uint8Array(val) : val;
-    return concatBytes(cborUint(0x40, b.length), b);
-  }
-
-  if (Array.isArray(val)) {
-    const items = val.map(cborEncode);
-    return concatBytes(cborUint(0x80, val.length), ...items);
-  }
-
-  if (typeof val === "object") {
-    const keys    = Object.keys(val);
-    const entries = keys.flatMap(k => [cborEncode(k), cborEncode(val[k])]);
-    return concatBytes(cborUint(0xa0, keys.length), ...entries);
-  }
-
-  return new Uint8Array([0xf6]);
-}
-
-function cborUint(majorShifted, n) {
-  if (n <= 23)         return new Uint8Array([majorShifted | n]);
-  if (n <= 0xff)       return new Uint8Array([majorShifted | 24, n]);
-  if (n <= 0xffff)     return new Uint8Array([majorShifted | 25, (n>>8)&0xff, n&0xff]);
-  if (n <= 0xffffffff) return new Uint8Array([majorShifted | 26, (n>>24)&0xff, (n>>16)&0xff, (n>>8)&0xff, n&0xff]);
-  return new Uint8Array([majorShifted | 27, 0,0,0,0, (n>>24)&0xff, (n>>16)&0xff, (n>>8)&0xff, n&0xff]);
-}
-
-// CBOR-encode a plain JS object as a map (integer or string keys)
-function encodeCborMap(obj) {
-  return cborEncode(obj);
-}
-
-// Encode the full C2PA manifest as CBOR
-function encodeManifestCbor(manifestJson) {
-  return cborEncode(manifestJson);
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// COSE_Sign1  (RFC 8152)
-// Structure:  Tag(18) [ protected_bstr, unprotected_map, payload_bstr, signature_bstr ]
-// ═══════════════════════════════════════════════════════════════════════════
-function buildCoseSigStructure(protectedHeaderBytes, payloadBytes) {
-  // Sig_Structure = ["Signature1", protected_bstr, aad_bstr, payload_bstr]
-  const sigStruct = cborEncode([
-    "Signature1",
-    protectedHeaderBytes,
-    new Uint8Array(0),   // empty AAD
-    payloadBytes
-  ]);
-  return sigStruct;
-}
-
-function buildCoseSign1(protectedHeaderBytes, payloadBytes, sigBytes, certDerBytes) {
-  // COSE_Sign1 = Tag(18) [ protected_bstr, { x5chain: [cert_bstr] }, payload_bstr, sig_bstr ]
-  // unprotected header: { 33: [certDer] }  (33 = x5chain)
-  const unprotected = new Map();
-  // Encode unprotected header manually: {33: [cert]}
-  const certArray   = cborEncode([certDerBytes]);
-  const unprotBytes = concatBytes(
-    new Uint8Array([0xa1]),       // map(1)
-    new Uint8Array([0x18, 0x21]), // key 33
-    certArray
-  );
-
-  // COSE_Sign1 array (without tag for simplicity — validators accept both)
-  const coseArray = concatBytes(
-    new Uint8Array([0x84]),        // array(4)
-    cborEncode(protectedHeaderBytes),
-    unprotBytes,
-    cborEncode(payloadBytes),
-    cborEncode(sigBytes)
-  );
-
-  // Wrap in CBOR tag 18
-  return concatBytes(new Uint8Array([0xd2]), coseArray);
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// JUMBF BOX BUILDER  (ISO 19566-5)
-// Each box: LBox(4) + TBox(4) + [XLBox(8)] + UUID(16) + ToggleBox(1) + Label + payload
-// ═══════════════════════════════════════════════════════════════════════════
-
-// UUIDs defined by C2PA spec
-const JUMBF_UUID = {
-  MANIFEST_STORE:  hexBytes("6332706100110010800000aa00389b71"), // c2pa manifest store
-  MANIFEST:        hexBytes("6332706100110010800000aa00389b71"), // same for manifest box
-  CLAIM:           hexBytes("6332636c00110010800000aa00389b71"), // c2cl
-  COSE:            hexBytes("6332637300110010800000aa00389b71"), // c2cs
-  ASSERTION_STORE: hexBytes("6332617300110010800000aa00389b71"), // c2as
-  ASSERTION:       hexBytes("6332617400110010800000aa00389b71"), // c2at
-  JSON:            hexBytes("6a736f6e00110010800000aa00389b71"), // json
-  CBOR:            hexBytes("63626f7200110010800000aa00389b71"), // cbor
-};
-
-function jumbfBox(typeUuid, label, payload, descFlags) {
-  // Description box: UUID(16) + toggles(1) + label(n) + NUL
-  const labelBytes  = new TextEncoder().encode(label + "\x00");
-  const toggleByte  = new Uint8Array([descFlags || 0x03]); // requestable + labelled
-  const descContent = concatBytes(typeUuid, toggleByte, labelBytes);
-
-  // jumd box (description): LBox + "jumd" + content
-  const jumdPayload = descContent;
-  const jumdTBox    = new TextEncoder().encode("jumd");
-  const jumdLen     = 8 + jumdPayload.length;
-  const jumdLenBuf  = new Uint8Array(4);
-  new DataView(jumdLenBuf.buffer).setUint32(0, jumdLen, false);
-  const jumdBox_    = concatBytes(jumdLenBuf, jumdTBox, jumdPayload);
-
-  // content box
-  const payloadBytes = payload instanceof Uint8Array ? payload : new Uint8Array(payload);
-
-  // superbox: LBox + "jumb" + jumdBox + contentBox
-  const jumbTBox   = new TextEncoder().encode("jumb");
-  const innerBytes = concatBytes(jumdBox_, payloadBytes);
-  const totalLen   = 8 + innerBytes.length;
-  const lenBuf     = new Uint8Array(4);
-  new DataView(lenBuf.buffer).setUint32(0, totalLen, false);
-  return concatBytes(lenBuf, jumbTBox, innerBytes);
-}
-
-function jumbfLeafBox(tboxStr, payload) {
-  // Simple leaf: LBox(4) + TBox(4) + payload
-  const tbox   = new TextEncoder().encode(tboxStr.padEnd(4).slice(0,4));
-  const p      = payload instanceof Uint8Array ? payload : new Uint8Array(payload);
-  const total  = 8 + p.length;
-  const lenBuf = new Uint8Array(4);
-  new DataView(lenBuf.buffer).setUint32(0, total, false);
-  return concatBytes(lenBuf, tbox, p);
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// ASSEMBLE FULL JUMBF MANIFEST STORE + EMBED IN JPEG
-// ═══════════════════════════════════════════════════════════════════════════
-async function embedJumbfInImage(imgBuffer, claimCbor, coseSign1, manifestJson) {
-  const label = "urn:uuid:" + arrayToHex(crypto.getRandomValues(new Uint8Array(16)));
-
-  // 1. JSON assertion box (c2pa.actions)
-  const actionsJson  = new TextEncoder().encode(JSON.stringify(manifestJson.assertions[0].data));
-  const assertionBox = jumbfBox(
-    JUMBF_UUID.JSON,
-    "c2pa.actions",
-    jumbfLeafBox("json", actionsJson)
-  );
-
-  // 2. Assertion store
-  const assertionStore = jumbfBox(
-    JUMBF_UUID.ASSERTION_STORE,
-    "c2pa.assertions",
-    assertionBox
-  );
-
-  // 3. Claim box (CBOR-encoded manifest)
-  const claimBox = jumbfBox(
-    JUMBF_UUID.CBOR,
-    "c2pa.claim",
-    jumbfLeafBox("cbor", claimCbor)
-  );
-
-  // 4. Signature box (COSE_Sign1)
-  const sigBox = jumbfBox(
-    JUMBF_UUID.COSE,
-    "c2pa.signature",
-    jumbfLeafBox("bidb", coseSign1)
-  );
-
-  // 5. Manifest box (contains assertion store + claim + sig)
-  const manifestBox = jumbfBox(
-    JUMBF_UUID.MANIFEST,
-    label,
-    concatBytes(assertionStore, claimBox, sigBox)
-  );
-
-  // 6. Manifest store (top-level container)
-  const manifestStore = jumbfBox(
-    JUMBF_UUID.MANIFEST_STORE,
-    "c2pa",
-    manifestBox
-  );
-
-  // 7. Wrap in JPEG APP11 segment (marker 0xFFEB)
-  // APP11 for C2PA: marker(2) + length(2) + CI(2) + En(2) + Z(4) + LBox content
-  const ci     = new Uint8Array([0x4A, 0x50]); // "JP"
-  const en     = new Uint8Array([0x02, 0x00]); // box instance number
-  const z      = new Uint8Array([0x00, 0x00, 0x00, 0x01]); // sequence number
-  const app11Body   = concatBytes(ci, en, z, manifestStore);
-  const app11SegLen = app11Body.length + 2; // +2 for length field itself
-  if (app11SegLen > 0xFFFF) throw new Error("Manifest too large for single APP11 segment");
-  const app11Marker = new Uint8Array([0xFF, 0xEB]);
-  const app11Len    = new Uint8Array([(app11SegLen >> 8) & 0xff, app11SegLen & 0xff]);
-  const app11Seg    = concatBytes(app11Marker, app11Len, app11Body);
-
-  // Also keep a fallback custom segment for internal verify tab
-  const fallbackPayload  = new TextEncoder().encode(JSON.stringify({ manifest: manifestJson, signature: arrayToBase64(new Uint8Array(coseSign1)), version: "2.0" }));
-  const fallbackLabel    = new TextEncoder().encode("c2pa\x00");
-  const fallbackLen      = fallbackLabel.length + fallbackPayload.length + 2;
-  const fallbackLenBytes = new Uint8Array([(fallbackLen >> 8) & 0xff, fallbackLen & 0xff]);
-  const fallbackSeg      = concatBytes(new Uint8Array([0xFF, 0xEB]), fallbackLenBytes, fallbackLabel, fallbackPayload);
-
-  // 8. Insert both segments right after SOI
-  const orig   = new Uint8Array(imgBuffer);
-  const result = concatBytes(orig.slice(0, 2), app11Seg, fallbackSeg, orig.slice(2));
   return new Blob([result], { type: "image/jpeg" });
 }
 
@@ -2022,44 +1823,49 @@ function extractManifestFromImage(buffer) {
   return null;
 }
 
-// ── Strip all C2PA-injected APP11 segments from a JPEG buffer ────────────
-// Strips JUMBF APP11 (JP marker), fallback c2pa\x00 APP11, and injected XMP APP1
-// so that re-hashing restores the exact original camera JPEG bytes.
+// ── Strip the APP11/c2pa segment from a JPEG buffer ───────────────────────
+// This reconstructs what the original image bytes looked like before
+// the manifest was embedded — so we can re-hash and compare.
 function stripManifestSegment(buffer) {
   const bytes    = new Uint8Array(buffer);
-  const c2paLbl  = [0x63,0x32,0x70,0x61,0x00]; // "c2pa\0"
-  const xmpStart = [0x68,0x74,0x74,0x70,0x3a,0x2f,0x2f]; // "http://"
-  const jpMark   = [0x4A, 0x50]; // "JP" — JUMBF C2PA APP11
+  const labelStr = "c2pa\x00";
   const out      = [];
   let   i        = 0;
 
-  out.push(bytes[0], bytes[1]); i = 2; // SOI
+  // Keep SOI (first 2 bytes)
+  out.push(bytes[0], bytes[1]);
+  i = 2;
 
   while (i < bytes.length - 1) {
     if (bytes[i] !== 0xFF) { out.push(bytes[i++]); continue; }
+
     const marker = bytes[i+1];
-    if (marker === 0xD8 || marker === 0xD9) { out.push(bytes[i], bytes[i+1]); i += 2; continue; }
+
+    // SOI / EOI — no length field
+    if (marker === 0xD8 || marker === 0xD9) {
+      out.push(bytes[i], bytes[i+1]);
+      i += 2;
+      continue;
+    }
+
+    // All other markers have a 2-byte length after the marker
     if (i + 3 >= bytes.length) { out.push(bytes[i++]); continue; }
     const segLen = (bytes[i+2] << 8) | bytes[i+3];
 
-    if (marker === 0xEB && i + 5 < bytes.length) {
-      // Strip JUMBF APP11 (C2PA spec: starts with "JP" at byte offset +4)
-      if (bytes[i+4] === jpMark[0] && bytes[i+5] === jpMark[1]) {
-        i += 2 + segLen; continue;
+    // Check if this is our APP11 c2pa segment
+    if (marker === 0xEB && i + 4 + labelStr.length <= bytes.length) {
+      let isC2PA = true;
+      for (let j = 0; j < labelStr.length; j++) {
+        if (bytes[i + 4 + j] !== labelStr.charCodeAt(j)) { isC2PA = false; break; }
       }
-      // Strip fallback c2pa\0 APP11
-      let mc = (i + 4 + c2paLbl.length <= bytes.length);
-      if (mc) for (let j = 0; j < c2paLbl.length; j++) if (bytes[i+4+j] !== c2paLbl[j]) { mc=false; break; }
-      if (mc) { i += 2 + segLen; continue; }
+      if (isC2PA) {
+        // Skip this segment entirely — don't add to output
+        i += 2 + segLen;
+        continue;
+      }
     }
 
-    // Strip injected XMP APP1 (our namespace starts with "http://")
-    if (marker === 0xE1 && i + 4 + xmpStart.length <= bytes.length) {
-      let mx = true;
-      for (let j = 0; j < xmpStart.length; j++) if (bytes[i+4+j] !== xmpStart[j]) { mx=false; break; }
-      if (mx) { i += 2 + segLen; continue; }
-    }
-
+    // Keep any other segment
     const end = i + 2 + segLen;
     for (let k = i; k < end && k < bytes.length; k++) out.push(bytes[k]);
     i = end;
@@ -2083,24 +1889,98 @@ function formatRelative(date) {
 // ═══════════════════════════════════════════════════════════════════════════
 // DOWNLOAD + SHARE
 // ═══════════════════════════════════════════════════════════════════════════
-function downloadSigned() {
+function isIOS() {
+  return /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+    (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+}
+
+async function downloadSigned() {
   if (!State.signedBlob) return;
-  const url  = URL.createObjectURL(State.signedBlob);
-  
-  // Open in new tab
-  window.open(url, "_blank");
-  
-  //below code might not work in iOS
-  /*
-  const a    = document.createElement("a");
-  const ts   = new Date().toISOString().replace(/[:.]/g,"-").slice(0,19);
-  a.href = url; a.download = `c2pa-signed-${ts}.jpg`;
-  a.click();
-  URL.revokeObjectURL(url);
-  */
-  
-  showToast("Downloading signed image…", "success");
-  setTimeout(() => URL.revokeObjectURL(url), 5000);
+  const ts       = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const fileName = `c2pa-signed-${ts}.jpg`;
+
+  if (isIOS()) {
+    // LINE WebView on iOS blocks both a.click() blob downloads AND window.open().
+    // The only reliable escape hatch is the native Web Share API — it invokes
+    // the OS-level share sheet directly, bypassing all WebView restrictions.
+
+    // Strategy 1: Web Share API with file (iOS 15+, works inside LINE WebView)
+    if (navigator.share && navigator.canShare) {
+      const file = new File([State.signedBlob], fileName, { type: "image/jpeg" });
+      if (navigator.canShare({ files: [file] })) {
+        try {
+          await navigator.share({ files: [file], title: "C2PA Signed Image" });
+          showToast("Saved!", "success");
+          return;
+        } catch (e) {
+          if (e.name === "AbortError") return; // user cancelled — not an error
+          // fall through to Strategy 2
+        }
+      }
+    }
+
+    // Strategy 2: inline save modal — always works, no new window needed.
+    // User long-presses the image -> iOS context menu -> "Add to Photos" / "Save to Files".
+    const url = URL.createObjectURL(State.signedBlob);
+    showIOSSaveModal(url, fileName);
+
+  } else {
+    // Android / desktop — standard anchor click works fine
+    const url = URL.createObjectURL(State.signedBlob);
+    const a   = document.createElement("a");
+    a.href     = url;
+    a.download = fileName;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+    showToast("Downloading...", "success");
+  }
+}
+
+function showIOSSaveModal(blobUrl, fileName) {
+  const existing = document.getElementById("ios-save-modal");
+  if (existing) existing.remove();
+
+  const modal = document.createElement("div");
+  modal.id = "ios-save-modal";
+  modal.style.cssText = [
+    "position:fixed; inset:0; z-index:300;",
+    "background:rgba(10,12,16,0.97);",
+    "display:flex; flex-direction:column;",
+    "align-items:center; justify-content:center;",
+    "gap:16px; padding:24px;",
+    "backdrop-filter:blur(10px);"
+  ].join("");
+
+  const title = document.createElement("div");
+  title.style.cssText = "font-family:var(--sans);font-weight:800;font-size:17px;color:var(--text);";
+  title.textContent = "Save Signed Image";
+
+  const instructions = document.createElement("div");
+  instructions.style.cssText = "font-family:var(--mono);font-size:12px;color:var(--muted);text-align:center;line-height:1.9;";
+  instructions.innerHTML = "Long-press the image below, then tap<br><span style=\"color:var(--accent);font-weight:600;\">\"Add to Photos\"</span>&nbsp;or&nbsp;<span style=\"color:var(--accent);font-weight:600;\">\"Save to Files\"</span>";
+
+  const img = document.createElement("img");
+  img.src = blobUrl;
+  img.alt = "Long-press to save";
+  img.style.cssText = "max-width:100%;max-height:52vh;border-radius:12px;border:1px solid var(--border);object-fit:contain;";
+
+  const fileLabel = document.createElement("div");
+  fileLabel.style.cssText = "font-family:var(--mono);font-size:10px;color:var(--muted);";
+  fileLabel.textContent = fileName;
+
+  const closeBtn = document.createElement("button");
+  closeBtn.style.cssText = "padding:12px 36px;border-radius:10px;border:1px solid var(--border);background:transparent;color:var(--text);font-family:var(--sans);font-weight:600;font-size:14px;cursor:pointer;";
+  closeBtn.textContent = "Done";
+  closeBtn.onclick = () => modal.remove();
+
+  modal.appendChild(title);
+  modal.appendChild(instructions);
+  modal.appendChild(img);
+  modal.appendChild(fileLabel);
+  modal.appendChild(closeBtn);
+  document.body.appendChild(modal);
 }
 
 async function shareToLine() {
@@ -2252,7 +2132,7 @@ window.addEventListener("DOMContentLoaded", () => {
 
 //add apps version into display
 setText ("ver-status-txt",CONFIG.APP_VERSION);
-dot("ver-dot",true);
+
 </script>
 </body>
 </html>
